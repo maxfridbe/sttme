@@ -7,8 +7,7 @@
 //! Star Trek LCARS audio cues (`computerbeep_50` on listen start, `computerbeep_48` when done).
 
 use std::f32::consts::PI;
-use std::io::Cursor;
-use std::path::PathBuf;
+use std::io::{Cursor, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -137,13 +136,13 @@ pub struct ActiveCapture {
 
 #[derive(Debug)]
 enum CaptureBackend {
+    PwStream {
+        child: Child,
+        reader_handle: JoinHandle<Vec<f32>>,
+    },
     Cpal {
         stop_tx: Sender<()>,
         join_handle: JoinHandle<Vec<f32>>,
-    },
-    PwRecord {
-        child: Child,
-        wav_path: PathBuf,
     },
 }
 
@@ -152,22 +151,14 @@ impl ActiveCapture {
     ///
     /// # Errors
     ///
-    /// Returns an error if neither `cpal` (ALSA/PipeWire) nor `pw-record` can open an input stream.
+    /// Returns an error if neither `pw-record` (`PipeWire`) nor `cpal` (ALSA) can open an input stream.
     pub fn start() -> Result<Self> {
         let meter = Arc::new(WaveformMeter::new());
-        match start_cpal_capture(&meter) {
-            Ok(backend) => Ok(Self { backend, meter }),
-            Err(cpal_err) => {
-                event!(
-                    name: "audio.capture.cpal_fallback",
-                    Level::WARN,
-                    error.message = %cpal_err,
-                    "cpal capture unavailable ({{error.message}}), falling back to pw-record",
-                );
-                let backend = start_pw_record_capture()?;
-                Ok(Self { backend, meter })
-            }
+        if let Ok(backend) = start_pw_stream_capture(&meter) {
+            return Ok(Self { backend, meter });
         }
+        let backend = start_cpal_capture(&meter)?;
+        Ok(Self { backend, meter })
     }
 
     /// Returns a lock-free real-time RMS meter for driving the Wayland live waveform HUD.
@@ -180,9 +171,19 @@ impl ActiveCapture {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying capture worker panicked or fallback WAV decoding failed.
+    /// Returns an error if the underlying capture worker panicked.
     pub fn stop(self) -> Result<Vec<f32>> {
         match self.backend {
+            CaptureBackend::PwStream {
+                mut child,
+                reader_handle,
+            } => {
+                drop(child.kill());
+                drop(child.wait());
+                reader_handle
+                    .join()
+                    .map_err(|_panic| anyhow::anyhow!("PipeWire reader thread panicked"))
+            }
             CaptureBackend::Cpal {
                 stop_tx,
                 join_handle,
@@ -191,19 +192,6 @@ impl ActiveCapture {
                 join_handle
                     .join()
                     .map_err(|_panic| anyhow::anyhow!("audio capture worker thread panicked"))
-            }
-            CaptureBackend::PwRecord {
-                mut child,
-                wav_path,
-            } => {
-                // Send SIGINT so pw-record finalizes the WAV header cleanly before exiting.
-                let pid = child.id().to_string();
-                drop(Command::new("kill").args(["-INT", &pid]).status());
-                drop(child.wait());
-                let bytes = std::fs::read(&wav_path)
-                    .with_context(|| format!("failed to read {}", wav_path.display()))?;
-                drop(std::fs::remove_file(&wav_path));
-                decode_wav_to_16k_f32(&bytes)
             }
         }
     }
@@ -348,17 +336,69 @@ fn build_cpal_input_stream(
     stream_res.map_err(anyhow::Error::new)
 }
 
-fn start_pw_record_capture() -> Result<CaptureBackend> {
-    let wav_path = std::env::temp_dir().join(format!("sttme-rec-{}.wav", std::process::id()));
-    let child = Command::new("pw-record")
-        .args(["--rate", "16000", "--channels", "1", "--format", "s16"])
-        .arg(&wav_path)
+fn start_pw_stream_capture(meter: &Arc<WaveformMeter>) -> Result<CaptureBackend> {
+    let mut child = Command::new("pw-record")
+        .args([
+            "--raw",
+            "--rate",
+            "16000",
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+            "-",
+        ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to spawn fallback `pw-record`")?;
-    Ok(CaptureBackend::PwRecord { child, wav_path })
+        .context("failed to spawn `pw-record`")?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("missing stdout pipe on `pw-record`")?;
+    let meter_clone = Arc::clone(meter);
+
+    let reader_handle = thread::Builder::new()
+        .name("sttme-pw-in".to_owned())
+        .spawn(move || {
+            let mut samples = Vec::with_capacity((WHISPER_SAMPLE_RATE as usize) * 10);
+            // 320 bytes = 160 i16 samples = 10ms frame at 16,000 Hz for responsive 50 FPS metering.
+            let mut raw_buf = [0_u8; 640];
+            let mut carry_byte: Option<u8> = None;
+
+            while let Ok(read_n) = stdout.read(&mut raw_buf) {
+                if read_n == 0 {
+                    break;
+                }
+                let start_len = samples.len();
+                let mut slice = &raw_buf[..read_n];
+                if let Some(prev) = carry_byte.take()
+                    && let Some((&first, rest)) = slice.split_first()
+                {
+                    let sample = i16::from_le_bytes([prev, first]);
+                    samples.push(f32::from(sample) / 32_768.0);
+                    slice = rest;
+                }
+                let (pairs, rem) = slice.as_chunks::<2>();
+                for &pair in pairs {
+                    let sample = i16::from_le_bytes(pair);
+                    samples.push(f32::from(sample) / 32_768.0);
+                }
+                if let Some(&leftover) = rem.first() {
+                    carry_byte = Some(leftover);
+                }
+                update_meter_from_slice(&meter_clone, &samples[start_len..]);
+            }
+            samples
+        })
+        .context("failed to spawn PipeWire audio reader thread")?;
+
+    Ok(CaptureBackend::PwStream {
+        child,
+        reader_handle,
+    })
 }
 
 fn push_mono_f32(buf: &Mutex<Vec<f32>>, meter: &WaveformMeter, data: &[f32], channels: usize) {
@@ -564,15 +604,49 @@ pub fn play_beep(kind: BeepKind) {
         thread::Builder::new()
             .name("sttme-beep".to_owned())
             .spawn(move || {
-                let (samples, src_rate) = load_cue_samples(kind);
-                if samples.is_empty() {
+                if play_cue_pipewire(kind) {
                     return;
                 }
-                if play_samples_cpal(&samples, src_rate).is_err() {
+                let (samples, src_rate) = load_cue_samples(kind);
+                if !samples.is_empty() && play_samples_cpal(&samples, src_rate).is_err() {
                     play_samples_pw_fallback(&samples, src_rate);
                 }
             }),
     );
+}
+
+fn play_cue_pipewire(kind: BeepKind) -> bool {
+    let wav_cow: std::borrow::Cow<'static, [u8]> = match kind {
+        BeepKind::Start => std::borrow::Cow::Borrowed(BEEP_LISTENING_WAV),
+        BeepKind::Success => std::borrow::Cow::Borrowed(BEEP_PROCESSED_WAV),
+        BeepKind::Error => {
+            let Ok(encoded) = encode_wav_mono(&synthesize_error_tone(), SYNTH_ERROR_SAMPLE_RATE)
+            else {
+                return false;
+            };
+            std::borrow::Cow::Owned(encoded)
+        }
+    };
+
+    let base_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let wav_path = base_dir.join(format!(
+        "sttme-cue-{}-{:?}.wav",
+        std::process::id(),
+        thread::current().id()
+    ));
+    if std::fs::write(&wav_path, wav_cow.as_ref()).is_err() {
+        return false;
+    }
+    let ok = Command::new("pw-play")
+        .arg(&wav_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    drop(std::fs::remove_file(&wav_path));
+    ok
 }
 
 fn load_cue_samples(kind: BeepKind) -> (Vec<f32>, u32) {
