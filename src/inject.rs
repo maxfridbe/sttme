@@ -1,34 +1,53 @@
 // Rust guideline compliant 2026-02-21
-//! Text sanitization (Enter-keystroke stripping) and Wayland/X11 input injection.
+//! Text sanitization (Enter-keystroke stripping) and Wayland/X11/Win32 input injection.
 //!
-//! Provides two defense-in-depth guarantees when targeting Alacritty:
+//! Provides defense-in-depth guarantees when targeting terminals and desktop windows:
 //! 1. [`sanitize_for_alacritty`] strips all CR/LF, Unicode line/paragraph separators, and
 //!    control characters so no newline can ever execute a terminal command prematurely.
-//! 2. [`WaylandVirtualKeyboard`] maps Unicode codepoints exclusively onto high XKB keycodes
-//!    (`128..=228`, evdev scancodes `120..=220`), avoiding physical scancode collisions with
-//!    `KEY_ENTER` (`28`), `KEY_KPENTER` (`96`), `KEY_ESC` (`1`), and `KEY_F12` (`88`).
+//! 2. On Linux Wayland, maps Unicode codepoints exclusively onto high XKB keycodes (`128..=228`).
+//! 3. On Windows, emits `SendInput` `KEYEVENTF_UNICODE` UTF-16 events directly without touching
+//!    the clipboard.
 
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::fmt::Write as _;
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::{Context, bail};
+#[cfg(unix)]
 use rustix::fs::{MemfdFlags, memfd_create};
 use tracing::{Level, event};
+#[cfg(unix)]
 use wayland_client::protocol::wl_keyboard::KeymapFormat;
+#[cfg(unix)]
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+#[cfg(unix)]
 use wayland_client::protocol::wl_seat::{self, WlSeat};
+#[cfg(unix)]
 use wayland_client::{Connection, Dispatch, QueueHandle};
+#[cfg(unix)]
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::{
     self, ZwpVirtualKeyboardManagerV1,
 };
+#[cfg(unix)]
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::{
     self, ZwpVirtualKeyboardV1,
 };
@@ -39,56 +58,67 @@ use crate::config::InputMethod;
 ///
 /// Chosen well above standard PC keys (`1..=119`, which include `KEY_ENTER = 28`, `KEY_F12 = 88`,
 /// and `KEY_KPENTER = 96`) so `winit`/Alacritty physical-key bindings are never triggered.
+#[cfg(unix)]
 const SAFE_XKB_KEYCODE_BASE: u32 = 128;
 
 /// Maximum distinct Unicode characters packed into a single dynamic XKB keymap upload.
 ///
 /// Keeps XKB keycodes strictly within `128..=228` (`<= 255` XKB 8-bit keycode ceiling).
+#[cfg(unix)]
 const MAX_UNIQUE_CHARS_PER_CHUNK: usize = 100;
 
 /// Wayland `wl_keyboard::key_state` value representing a key press.
 ///
 /// Defined by the core Wayland `wl_keyboard.key_state` protocol enum (`pressed = 1`).
+#[cfg(unix)]
 const WL_KEY_PRESSED: u32 = 1;
 
 /// Wayland `wl_keyboard::key_state` value representing a key release.
 ///
 /// Defined by the core Wayland `wl_keyboard.key_state` protocol enum (`released = 0`).
+#[cfg(unix)]
 const WL_KEY_RELEASED: u32 = 0;
 
 /// Linux evdev scancode for `KEY_LEFTCTRL` (`29`, XKB keycode `37`).
 ///
 /// Used when synthesizing `Ctrl+Shift+V` or `Ctrl+V` clipboard paste shortcuts.
+#[cfg(unix)]
 const EVDEV_KEY_LEFTCTRL: u32 = 29;
 
 /// Linux evdev scancode for `KEY_LEFTSHIFT` (`42`, XKB keycode `50`).
 ///
 /// Used alongside [`EVDEV_KEY_LEFTCTRL`] when synthesizing terminal `Ctrl+Shift+V` paste.
+#[cfg(unix)]
 const EVDEV_KEY_LEFTSHIFT: u32 = 42;
 
 /// Linux evdev scancode for `KEY_V` (`47`, XKB keycode `55`).
 ///
 /// Triggers paste when combined with `Ctrl` or `Ctrl+Shift` on a US XKB layout.
+#[cfg(unix)]
 const EVDEV_KEY_V: u32 = 47;
 
 /// XKB depressed modifier bitmask for `Control` (`bit 2 = 4`) in the standard `complete` map.
 ///
 /// Sent via `zwp_virtual_keyboard_v1.modifiers` during paste shortcut synthesis.
+#[cfg(unix)]
 const XKB_MOD_CTRL_MASK: u32 = 4;
 
 /// XKB depressed modifier bitmask for `Shift` (`bit 0 = 1`) in the standard `complete` map.
 ///
 /// Combined with [`XKB_MOD_CTRL_MASK`] (`1 | 4 = 5`) for `Ctrl+Shift+V` terminal paste.
+#[cfg(unix)]
 const XKB_MOD_SHIFT_MASK: u32 = 1;
 
 /// Number of characters emitted before performing a Wayland socket flush + brief yield.
 ///
 /// Prevents overflowing client PTY input buffers on long multi-sentence transcriptions.
+#[cfg(unix)]
 const KEYSTROKE_BATCH_SIZE: usize = 24;
 
 /// Pause between keystroke batches (`2ms`) to preserve strict ordering in terminal PTYs.
 ///
 /// Small enough that 240 characters complete in ~20ms while keeping Wayland queues smooth.
+#[cfg(unix)]
 const KEYSTROKE_BATCH_PAUSE: Duration = Duration::from_millis(2);
 
 /// Strips all Enter/Return keystrokes, Unicode line breaks, and control characters for Alacritty.
@@ -184,6 +214,7 @@ pub fn inject_text(
         return Ok(());
     }
 
+    #[cfg(unix)]
     match method {
         InputMethod::Type => {
             if let Err(vk_err) =
@@ -203,12 +234,36 @@ pub fn inject_text(
         }
     }
 
+    #[cfg(windows)]
+    {
+        let _ = wayland_display_override;
+        match method {
+            InputMethod::Type => {
+                if let Err(err) =
+                    crate::win_platform::win32_type_text(&effective_text, forbid_enter_keys)
+                {
+                    event!(
+                        name: "inject.win32_type.fallback",
+                        Level::WARN,
+                        error.message = %err,
+                        "Win32 SendInput typing failed ({{error.message}}), falling back to clipboard paste",
+                    );
+                    crate::win_platform::win32_paste_via_clipboard(&effective_text, is_terminal)?;
+                }
+            }
+            InputMethod::Paste => {
+                crate::win_platform::win32_paste_via_clipboard(&effective_text, is_terminal)?;
+            }
+        }
+    }
+
     Ok(())
 }
 
 /// Builds a self-contained XKB keymap mapping `unique_chars` onto safe high keycodes.
 ///
 /// Exposed at module level so unit tests can validate every generated map with `xkbcomp`.
+#[cfg(unix)]
 #[must_use]
 pub fn build_unicode_xkb_keymap(unique_chars: &[char]) -> (String, HashMap<char, u32>) {
     let mut keycodes_sec = String::from(
@@ -241,6 +296,7 @@ pub fn build_unicode_xkb_keymap(unique_chars: &[char]) -> (String, HashMap<char,
     (full, char_to_evdev)
 }
 
+#[cfg(unix)]
 fn format_xkb_keysym(ch: char) -> String {
     if ch == ' ' {
         "space".to_owned()
@@ -249,12 +305,14 @@ fn format_xkb_keysym(ch: char) -> String {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Default)]
 struct WaylandVkState {
     seat: Option<WlSeat>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
 }
 
+#[cfg(unix)]
 impl Dispatch<WlRegistry, ()> for WaylandVkState {
     fn event(
         state: &mut Self,
@@ -284,6 +342,7 @@ impl Dispatch<WlRegistry, ()> for WaylandVkState {
     }
 }
 
+#[cfg(unix)]
 impl Dispatch<WlSeat, ()> for WaylandVkState {
     fn event(
         _: &mut Self,
@@ -296,6 +355,7 @@ impl Dispatch<WlSeat, ()> for WaylandVkState {
     }
 }
 
+#[cfg(unix)]
 impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for WaylandVkState {
     fn event(
         _: &mut Self,
@@ -308,6 +368,7 @@ impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for WaylandVkState {
     }
 }
 
+#[cfg(unix)]
 impl Dispatch<ZwpVirtualKeyboardV1, ()> for WaylandVkState {
     fn event(
         _: &mut Self,
@@ -320,6 +381,7 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for WaylandVkState {
     }
 }
 
+#[cfg(unix)]
 fn connect_wayland(display_override: Option<&str>) -> Result<Connection> {
     if let Some(disp) = display_override
         && let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
@@ -339,6 +401,7 @@ fn connect_wayland(display_override: Option<&str>) -> Result<Connection> {
 /// # Errors
 ///
 /// Returns an error if Wayland connection fails or `zwp_virtual_keyboard_manager_v1` is absent.
+#[cfg(unix)]
 pub fn probe_wayland_virtual_keyboard(display_override: Option<&str>) -> Result<()> {
     let conn = connect_wayland(display_override)?;
     let mut event_queue = conn.new_event_queue();
@@ -365,6 +428,7 @@ pub fn probe_wayland_virtual_keyboard(display_override: Option<&str>) -> Result<
     Ok(())
 }
 
+#[cfg(unix)]
 fn wayland_type_text(
     text: &str,
     forbid_enter_keys: bool,
@@ -439,6 +503,7 @@ fn wayland_type_text(
     Ok(())
 }
 
+#[cfg(unix)]
 fn split_by_unique_char_budget(chars: &[char], max_unique: usize) -> Vec<&[char]> {
     let mut result = Vec::new();
     let mut start = 0;
@@ -461,6 +526,7 @@ fn split_by_unique_char_budget(chars: &[char], max_unique: usize) -> Vec<&[char]
     result
 }
 
+#[cfg(unix)]
 fn upload_keymap(vk: &ZwpVirtualKeyboardV1, keymap_text: &str) -> Result<()> {
     let name = CString::new("sttme-xkb").context("invalid memfd name")?;
     let fd = memfd_create(&name, MemfdFlags::CLOEXEC).context("memfd_create failed")?;
@@ -478,6 +544,7 @@ fn upload_keymap(vk: &ZwpVirtualKeyboardV1, keymap_text: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn paste_via_clipboard(
     text: &str,
     is_terminal: bool,
@@ -516,6 +583,7 @@ fn paste_via_clipboard(
     Ok(())
 }
 
+#[cfg(unix)]
 fn wayland_send_paste_shortcut(is_terminal: bool, display_override: Option<&str>) -> Result<()> {
     let conn = connect_wayland(display_override)?;
     let mut event_queue = conn.new_event_queue();
@@ -566,6 +634,7 @@ fn wayland_send_paste_shortcut(is_terminal: bool, display_override: Option<&str>
     Ok(())
 }
 
+#[cfg(unix)]
 fn read_clipboard(wayland_display_override: Option<&str>) -> Option<String> {
     let mut cmd = Command::new("wl-paste");
     cmd.arg("--no-newline").stderr(Stdio::null());
@@ -588,6 +657,7 @@ fn read_clipboard(wayland_display_override: Option<&str>) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+#[cfg(unix)]
 fn write_clipboard(text: &str, wayland_display_override: Option<&str>) -> Result<()> {
     let mut cmd = Command::new("wl-copy");
     if let Some(disp) = wayland_display_override {
@@ -648,6 +718,7 @@ mod tests {
         assert!(!out.contains('\r'));
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_unicode_xkb_keymap_compiles_cleanly_with_xkbcomp() {
         let sample_chars = [

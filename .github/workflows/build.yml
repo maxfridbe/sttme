@@ -1,4 +1,4 @@
-name: Build & Release Linux Binaries
+name: Build & Release Binaries
 
 on:
   push:
@@ -16,6 +16,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Release versions follow vYY.MMDD.## (e.g. v26.1029.01); untagged builds report dev-<sha>.
+  STTME_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('dev-{0}', github.sha) }}
 
 jobs:
   check:
@@ -24,6 +26,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate release tag format (vYY.MMDD.##)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]{2}\.[0-9]{4}\.[0-9]{2}$ ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} must match vYY.MMDD.## (e.g. v26.1029.01)"
+            exit 1
+          fi
 
       - name: Install build and test dependencies
         run: |
@@ -39,10 +49,26 @@ jobs:
             xkb-data \
             shellcheck
 
-      - name: Validate install scripts with ShellCheck
+      - name: Validate Linux install scripts with ShellCheck
         run: |
           shellcheck install.sh uninstall.sh
           bash -n install.sh uninstall.sh
+
+      - name: Validate Windows PowerShell installer syntax
+        shell: pwsh
+        run: |
+          foreach ($script in @("install.ps1", "uninstall.ps1")) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$null,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.ToString() }
+              throw "PowerShell syntax error in $script"
+            }
+          }
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -71,10 +97,10 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            cmake_flags: "-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
+            ggml_x86: "ON"
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            cmake_flags: "-DGGML_NATIVE=OFF"
+            ggml_x86: "OFF"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -96,11 +122,17 @@ jobs:
       - name: Cache Cargo registry and release target
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.arch }}
+          key: release-linux-${{ matrix.arch }}
 
       - name: Build optimized release binary
         env:
-          CMAKE_ARGS: ${{ matrix.cmake_flags }}
+          # whisper-rs-sys forwards every GGML_* env var as a CMake define.
+          # GGML_NATIVE=OFF keeps the binary portable across x86 CPUs.
+          GGML_NATIVE: "OFF"
+          GGML_AVX: ${{ matrix.ggml_x86 }}
+          GGML_AVX2: ${{ matrix.ggml_x86 }}
+          GGML_FMA: ${{ matrix.ggml_x86 }}
+          GGML_F16C: ${{ matrix.ggml_x86 }}
         run: cargo build --release --locked
 
       - name: Smoke-test compiled binary
@@ -135,9 +167,86 @@ jobs:
             dist/sttme-linux-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
 
+  build-windows:
+    name: Build Windows Tray (x86_64)
+    needs: check
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry and Windows release target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-x86_64
+
+      - name: Run Windows Clippy lints
+        env:
+          GGML_NATIVE: "OFF"
+          GGML_AVX: "ON"
+          GGML_AVX2: "ON"
+          GGML_FMA: "ON"
+          GGML_F16C: "ON"
+        run: cargo clippy --bins --tests --locked -- -D warnings
+
+      - name: Build optimized Windows System Tray binary
+        env:
+          GGML_NATIVE: "OFF"
+          GGML_AVX: "ON"
+          GGML_AVX2: "ON"
+          GGML_FMA: "ON"
+          GGML_F16C: "ON"
+        run: cargo build --release --locked
+
+      - name: Smoke-test Windows executable
+        shell: pwsh
+        run: |
+          # sttme.exe is a GUI-subsystem tray app; piping forces PowerShell to wait and capture stdout.
+          $ver = (& .\target\release\sttme.exe --version | Out-String).Trim()
+          Write-Host "Reported version: $ver"
+          if (-not $ver.Contains($env:STTME_VERSION)) { throw "Expected version $env:STTME_VERSION, got '$ver'" }
+          $help = (& .\target\release\sttme.exe --help | Out-String)
+          if (-not $help.Contains("tray")) { throw "Windows --help is missing the tray subcommand" }
+          Get-Item .\target\release\sttme.exe | Select-Object Name, Length
+
+      - name: Package Windows zip archive and SHA-256 checksum
+        shell: pwsh
+        run: |
+          $stageDir = "dist\sttme-windows-x86_64"
+          $zipFile = "dist\sttme-windows-x86_64.zip"
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          Copy-Item "target\release\sttme.exe" "$stageDir\sttme.exe" -Force
+          Copy-Item "install.ps1" "$stageDir\install.ps1" -Force
+          Copy-Item "uninstall.ps1" "$stageDir\uninstall.ps1" -Force
+          Copy-Item "README.md" "$stageDir\README.md" -Force
+          Copy-Item "LICENSE" "$stageDir\LICENSE" -Force
+          Compress-Archive -Path "$stageDir\*" -DestinationPath $zipFile -Force
+          $hash = (Get-FileHash -Path $zipFile -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) "dist\sttme-windows-x86_64.zip.sha256"),
+            "$hash  sttme-windows-x86_64.zip`n",
+            (New-Object System.Text.UTF8Encoding($false))
+          )
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sttme-windows-x86_64
+          path: |
+            dist/sttme-windows-x86_64.zip
+            dist/sttme-windows-x86_64.zip.sha256
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build-linux
+    needs:
+      - build-linux
+      - build-windows
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -146,20 +255,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download built Linux artifacts
+      - name: Download built Linux and Windows artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: Assemble SHA256SUMS and standalone installer
+      - name: Assemble SHA256SUMS and standalone installers
         run: |
           cp install.sh release-assets/install.sh
           cp uninstall.sh release-assets/uninstall.sh
+          cp install.ps1 release-assets/install.ps1
+          cp uninstall.ps1 release-assets/uninstall.ps1
           chmod +x release-assets/install.sh release-assets/uninstall.sh
           (
             cd release-assets
-            cat sttme-linux-*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+            cat sttme-*.sha256 | sort -k2 > SHA256SUMS
             sha256sum -c SHA256SUMS
           )
 
@@ -170,6 +281,9 @@ jobs:
           files: |
             release-assets/sttme-linux-x86_64.tar.gz
             release-assets/sttme-linux-aarch64.tar.gz
+            release-assets/sttme-windows-x86_64.zip
             release-assets/SHA256SUMS
             release-assets/install.sh
             release-assets/uninstall.sh
+            release-assets/install.ps1
+            release-assets/uninstall.ps1

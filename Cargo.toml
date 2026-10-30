@@ -1,13 +1,13 @@
 [package]
 name = "sttme"
-version = "0.1.0"
+version = "26.1029.1"
 edition = "2024"
-description = "Instant push-to-talk local Whisper speech-to-text daemon and CLI (Rust port of TalkType)"
+description = "Instant hold-to-talk local Whisper speech-to-text daemon, Windows tray app, and CLI (Rust port of TalkType)"
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/maxfridbe/sttme"
 repository = "https://github.com/maxfridbe/sttme"
-keywords = ["whisper", "speech-to-text", "wayland", "niri", "dictation"]
+keywords = ["whisper", "speech-to-text", "wayland", "windows", "dictation"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
@@ -20,7 +20,6 @@ futures-util = "0.3"
 hound = "3.5"
 mimalloc = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
-rustix = { version = "1.0", features = ["fs", "event"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10"
@@ -28,11 +27,31 @@ toml = "0.8"
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0", features = ["fs", "event"] }
 wayland-client = { version = "0.31", default-features = false }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 opt-level = 3
@@ -44,7 +63,7 @@ strip = "symbols"
 debug = 1
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "warn"
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
 redundant_imports = "warn"

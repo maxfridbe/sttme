@@ -7,7 +7,10 @@
 //! Star Trek LCARS audio cues (`computerbeep_50` on listen start, `computerbeep_48` when done).
 
 use std::f32::consts::PI;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -221,6 +224,7 @@ pub struct ActiveCapture {
 
 #[derive(Debug)]
 enum CaptureBackend {
+    #[cfg(unix)]
     PwStream {
         child: Child,
         reader_handle: JoinHandle<Vec<f32>>,
@@ -236,9 +240,10 @@ impl ActiveCapture {
     ///
     /// # Errors
     ///
-    /// Returns an error if neither `pw-record` (`PipeWire`) nor `cpal` (ALSA) can open an input stream.
+    /// Returns an error if neither `pw-record` (`PipeWire`) nor `cpal` (WASAPI / ALSA) can open an input stream.
     pub fn start() -> Result<Self> {
         let meter = Arc::new(WaveformMeter::new());
+        #[cfg(unix)]
         if let Ok(backend) = start_pw_stream_capture(&meter) {
             return Ok(Self { backend, meter });
         }
@@ -246,7 +251,7 @@ impl ActiveCapture {
         Ok(Self { backend, meter })
     }
 
-    /// Returns a lock-free real-time RMS meter for driving the Wayland live waveform HUD.
+    /// Returns a lock-free real-time RMS meter for driving the live waveform HUD.
     #[must_use]
     pub fn meter(&self) -> Arc<WaveformMeter> {
         Arc::clone(&self.meter)
@@ -259,6 +264,7 @@ impl ActiveCapture {
     /// Returns an error if the underlying capture worker panicked.
     pub fn stop(self) -> Result<Vec<f32>> {
         match self.backend {
+            #[cfg(unix)]
             CaptureBackend::PwStream {
                 mut child,
                 reader_handle,
@@ -454,6 +460,7 @@ fn build_cpal_input_stream(
     stream_res.map_err(anyhow::Error::new)
 }
 
+#[cfg(unix)]
 fn spawn_unbuffered_pw_record() -> Result<Child> {
     const PW_ARGS: [&str; 10] = [
         "--latency",
@@ -492,6 +499,7 @@ fn spawn_unbuffered_pw_record() -> Result<Child> {
         .context("failed to spawn `pw-record`")
 }
 
+#[cfg(unix)]
 fn start_pw_stream_capture(meter: &Arc<WaveformMeter>) -> Result<CaptureBackend> {
     let mut child = spawn_unbuffered_pw_record()?;
 
@@ -736,17 +744,20 @@ pub fn play_beep(kind: BeepKind) {
         thread::Builder::new()
             .name("sttme-beep".to_owned())
             .spawn(move || {
+                #[cfg(unix)]
                 if play_cue_pipewire(kind) {
                     return;
                 }
                 let (samples, src_rate) = load_cue_samples(kind);
                 if !samples.is_empty() && play_samples_cpal(&samples, src_rate).is_err() {
+                    #[cfg(unix)]
                     play_samples_pw_fallback(&samples, src_rate);
                 }
             }),
     );
 }
 
+#[cfg(unix)]
 fn play_cue_pipewire(kind: BeepKind) -> bool {
     let wav_cow: std::borrow::Cow<'static, [u8]> = match kind {
         BeepKind::Start => std::borrow::Cow::Borrowed(BEEP_LISTENING_WAV),
@@ -897,6 +908,7 @@ fn build_cpal_output_stream(
     stream_res.map_err(anyhow::Error::new)
 }
 
+#[cfg(unix)]
 fn play_samples_pw_fallback(samples: &[f32], src_rate: u32) {
     let Ok(wav_bytes) = encode_wav_mono(samples, src_rate) else {
         return;

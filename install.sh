@@ -55,7 +55,7 @@ Options:
   --bin-dir <DIR>     Directory to install the sttme binary (default: ~/.local/bin)
   --model <NAME>      Whisper GGML model to pre-download: tiny, tiny.en, base, base.en,
                       small, medium, large-v3, large-v3-turbo, or none (default: base)
-  --version <TAG>     Release tag to install, e.g. v0.1.0 or latest (default: latest)
+  --version <TAG>     Release tag to install, e.g. v26.1029.01 or latest (default: latest)
   --from-source       Compile sttme locally with Cargo instead of downloading a release
   --no-service        Do not create or enable the systemd --user sttme.service unit
   --uninstall         Stop daemon and remove installed binary and systemd user service

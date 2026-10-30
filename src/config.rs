@@ -164,19 +164,22 @@ impl Default for TranscriptionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TargetConfig {
+    /// Global hold-to-talk key name (`"f10"`, `"f9"`, `"f12"`, `"rctrl"`, `"ralt"`).
+    pub hotkey: String,
     /// Restrict speech-to-text output strictly to Alacritty windows.
     pub alacritty_only: bool,
-    /// Strip all Enter/Return/newline characters when typing or pasting into Alacritty.
+    /// Strip all Enter/Return/newline characters when typing or pasting into terminals.
     pub strip_alacritty_enter: bool,
     /// Append a trailing space after each dictated phrase so consecutive dictations separate cleanly.
     pub trailing_space: bool,
-    /// Preferred Wayland/X11 delivery mechanism.
+    /// Preferred Wayland/X11/Win32 delivery mechanism.
     pub input_method: InputMethod,
 }
 
 impl Default for TargetConfig {
     fn default() -> Self {
         Self {
+            hotkey: "f10".to_owned(),
             alacritty_only: false,
             strip_alacritty_enter: true,
             trailing_space: true,
@@ -272,21 +275,22 @@ pub fn legacy_talktype_config_path() -> PathBuf {
         .join("config.yaml")
 }
 
-/// Returns the `sttme` cache directory (`~/.cache/sttme`).
+/// Returns the `sttme` cache directory (`~/.cache/sttme` on Linux, `%LOCALAPPDATA%\sttme` on Windows).
 #[must_use]
 pub fn cache_dir() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
         .join("sttme")
 }
 
-/// Returns the local Whisper GGML model cache directory (`~/.cache/sttme/models`).
+/// Returns the local Whisper GGML model cache directory (`<cache_dir>/models`).
 #[must_use]
 pub fn models_dir() -> PathBuf {
     cache_dir().join("models")
 }
 
-/// Returns the Unix domain socket path used for instant client-to-daemon IPC.
+/// Returns the Unix domain socket path used for instant client-to-daemon IPC on Linux.
+#[cfg(unix)]
 #[must_use]
 pub fn socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -297,6 +301,7 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// Returns the daemon single-instance lock file path (`~/.cache/sttme/sttme.lock`).
+#[cfg(unix)]
 #[must_use]
 pub fn lock_file_path() -> PathBuf {
     cache_dir().join("sttme.lock")
