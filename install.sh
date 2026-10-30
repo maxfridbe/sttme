@@ -365,7 +365,7 @@ fi
 
 if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
     warn "${BIN_DIR} is not currently in your PATH. Add this to ~/.bashrc or ~/.zshrc:"
-    printf '    export PATH="%s:$PATH"\n' "${BIN_DIR}"
+    printf "    export PATH=\"%s:\$PATH\"\n" "${BIN_DIR}"
 fi
 
 printf '\n%sInstallation complete!%s\n' "${GREEN}${BOLD}" "${RESET}"
