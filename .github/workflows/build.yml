@@ -91,6 +91,17 @@ jobs:
             exit 1
           fi
 
+      - name: Run Windows Clippy lints (cross-target)
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          if ! cargo clippy --target x86_64-pc-windows-gnu --bins --tests --locked -- -D warnings 2>&1 | tee clippy-windows.log; then
+            echo "### Windows Clippy Failure" >> "$GITHUB_STEP_SUMMARY"
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat clippy-windows.log | head -n 60 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       - name: Run unit tests
         run: |
           if ! cargo test --locked 2>&1 | tee test.log; then
@@ -191,42 +202,48 @@ jobs:
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - name: Cache Cargo registry and Windows release target
         uses: Swatinem/rust-cache@v2
         with:
           key: release-windows-x86_64
 
-      - name: Run Windows Clippy lints
-        env:
-          GGML_NATIVE: "OFF"
-          GGML_AVX: "ON"
-          GGML_AVX2: "ON"
-          GGML_FMA: "ON"
-          GGML_F16C: "ON"
-        run: cargo clippy --bins --tests --locked -- -D warnings
-
       - name: Build optimized Windows System Tray binary
+        shell: pwsh
         env:
           GGML_NATIVE: "OFF"
           GGML_AVX: "ON"
           GGML_AVX2: "ON"
           GGML_FMA: "ON"
           GGML_F16C: "ON"
-        run: cargo build --release --locked
+        run: |
+          cargo build --release --locked 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Windows Release Build Failure"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```text'
+            Get-Content -Path build.log -Tail 150 | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+            exit 1
+          }
 
       - name: Smoke-test Windows executable
         shell: pwsh
         run: |
           # sttme.exe is a GUI-subsystem tray app; piping forces PowerShell to wait and capture stdout.
-          $ver = (& .\target\release\sttme.exe --version | Out-String).Trim()
-          Write-Host "Reported version: $ver"
-          if (-not $ver.Contains($env:STTME_VERSION)) { throw "Expected version $env:STTME_VERSION, got '$ver'" }
-          $help = (& .\target\release\sttme.exe --help | Out-String)
-          if (-not $help.Contains("tray")) { throw "Windows --help is missing the tray subcommand" }
-          Get-Item .\target\release\sttme.exe | Select-Object Name, Length
+          try {
+            $ver = (& .\target\release\sttme.exe --version | Out-String).Trim()
+            Write-Host "Reported version: $ver"
+            if (-not $ver.Contains($env:STTME_VERSION)) { throw "Expected version $env:STTME_VERSION, got '$ver'" }
+            $help = (& .\target\release\sttme.exe --help | Out-String)
+            if (-not $help.Contains("tray")) { throw "Windows --help is missing the tray subcommand" }
+            Get-Item .\target\release\sttme.exe | Select-Object Name, Length
+          } catch {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Windows Smoke Test Failure"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```text'
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $_.Exception.ToString()
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+            throw
+          }
 
       - name: Package Windows zip archive and SHA-256 checksum
         shell: pwsh
