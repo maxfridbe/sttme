@@ -1,21 +1,22 @@
 // Rust guideline compliant 2026-02-21
 //! Low-latency Unix domain socket IPC protocol and daemon auto-start client.
 //!
-//! When pressing `F12` in Alacritty, `sttme toggle` connects to `$XDG_RUNTIME_DIR/sttme.sock`,
-//! sends a single newline-delimited JSON [`IpcRequest`] containing the live session environment,
-//! and receives an [`IpcResponse`] in under a millisecond.
+//! When holding `F10` in Niri (or invoking any CLI subcommand), `sttme` connects synchronously to
+//! `$XDG_RUNTIME_DIR/sttme.sock`, sends a single newline-delimited JSON [`IpcRequest`] containing
+//! the live session environment, and receives an [`IpcResponse`] in under half a millisecond.
 
 use std::fmt::{self, Display, Formatter};
+use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
-/// Maximum time `sttme toggle` waits for an auto-spawned background daemon to bind its socket.
+/// Maximum time `sttme` waits for an auto-spawned background daemon to bind its socket.
 ///
 /// Loading a `base` GGML model on modern CPUs takes ~150-600ms, while first-run download of
 /// `ggml-base.bin` over broadband can take up to ~60-90s. Setting 120s prevents premature client
@@ -88,9 +89,12 @@ pub struct ClientContext {
     pub alacritty_window_id: Option<String>,
     /// Optional explicit target filter (`"alacritty"` or `"all"`).
     pub target_filter: Option<String>,
-    /// Optional evdev keycode (`88` = `F12`) monitored for physical release during `Hold`.
+    /// Optional evdev keycode (`68` = `F10`) monitored during `Hold`.
     #[serde(default)]
     pub hold_key: Option<u32>,
+    /// Whether `Hold` should request an exclusive `wl_keyboard` grab instead of compositor repeat lease.
+    #[serde(default)]
+    pub grab_keyboard: bool,
 }
 
 impl ClientContext {
@@ -103,13 +107,21 @@ impl ClientContext {
             alacritty_window_id: std::env::var("ALACRITTY_WINDOW_ID").ok(),
             target_filter,
             hold_key: None,
+            grab_keyboard: false,
         }
     }
 
-    /// Attaches the evdev keycode monitored for physical key release during `Hold`.
+    /// Attaches the evdev keycode monitored during `Hold`.
     #[must_use]
     pub const fn with_hold_key(mut self, evdev_key: u32) -> Self {
         self.hold_key = Some(evdev_key);
+        self
+    }
+
+    /// Configures whether `Hold` uses an exclusive Wayland keyboard grab.
+    #[must_use]
+    pub const fn with_grab_keyboard(mut self, grab: bool) -> Self {
+        self.grab_keyboard = grab;
         self
     }
 }
@@ -155,15 +167,18 @@ pub struct IpcResponse {
 
 /// Sends an [`IpcRequest`] to `socket_path`, optionally spawning `sttme daemon` on cold start.
 ///
+/// Uses synchronous Unix domain socket I/O so hotkey and key-repeat triggers complete in `< 0.5ms`
+/// without initializing an async thread-pool runtime.
+///
 /// # Errors
 ///
 /// Returns an error if the daemon cannot be reached or started, or if socket I/O fails.
-pub async fn send_ipc_request(
+pub fn send_ipc_request(
     socket_path: &Path,
     request: &IpcRequest,
     autostart_daemon: bool,
 ) -> Result<IpcResponse> {
-    let stream = match UnixStream::connect(socket_path).await {
+    let mut stream = match UnixStream::connect(socket_path) {
         Ok(s) => s,
         Err(first_err) => {
             if !autostart_daemon {
@@ -172,27 +187,23 @@ pub async fn send_ipc_request(
                 });
             }
             spawn_detached_daemon()?;
-            wait_for_daemon_socket(socket_path).await?
+            wait_for_daemon_socket(socket_path)?
         }
     };
 
-    let (read_half, mut write_half) = stream.into_split();
     let mut payload = serde_json::to_string(request).context("failed to serialize IPC request")?;
     payload.push('\n');
-    write_half
+    stream
         .write_all(payload.as_bytes())
-        .await
         .context("failed to write IPC request")?;
-    write_half
-        .shutdown()
-        .await
+    stream
+        .shutdown(Shutdown::Write)
         .context("failed to flush IPC socket")?;
 
-    let mut reader = BufReader::new(read_half);
+    let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let bytes = reader
         .read_line(&mut line)
-        .await
         .context("failed to read IPC response")?;
     if bytes == 0 {
         bail!("daemon closed IPC connection without replying");
@@ -215,10 +226,10 @@ fn spawn_detached_daemon() -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_daemon_socket(socket_path: &Path) -> Result<UnixStream> {
+fn wait_for_daemon_socket(socket_path: &Path) -> Result<UnixStream> {
     let deadline = Instant::now() + DAEMON_AUTOSTART_TIMEOUT;
     loop {
-        if let Ok(stream) = UnixStream::connect(socket_path).await {
+        if let Ok(stream) = UnixStream::connect(socket_path) {
             return Ok(stream);
         }
         if Instant::now() >= deadline {
@@ -227,6 +238,6 @@ async fn wait_for_daemon_socket(socket_path: &Path) -> Result<UnixStream> {
                 socket_path.display()
             );
         }
-        tokio::time::sleep(DAEMON_AUTOSTART_POLL_INTERVAL).await;
+        std::thread::sleep(DAEMON_AUTOSTART_POLL_INTERVAL);
     }
 }

@@ -1,57 +1,64 @@
 // Rust guideline compliant 2026-02-21
 //! Anti-aliased top-center Wayland `ARGB8888` live voice waveform HUD renderer.
 //!
-//! Renders a translucent rounded LCARS capsule (`272x50`) with a pulsing recording beacon
-//! and `30` real-time scrolling voice waveform bars using signed-distance-field (`SDF`)
-//! sub-pixel anti-aliasing and premultiplied alpha.
+//! Renders a translucent rounded LCARS capsule (`320x62`) with a pulsing recording beacon
+//! and `34` real-time adaptive-gain scrolling voice waveform bars using signed-distance-field
+//! (`SDF`) sub-pixel anti-aliasing and premultiplied alpha.
 
 use std::f32::consts::PI;
 
 /// Logical width in pixels of the top-center Wayland waveform overlay capsule.
 ///
-/// Wide enough to display a `30`-bar scrolling voice trace without obscuring terminal content.
-pub const HUD_WIDTH: u32 = 272;
+/// Sized generously for `HiDPI` / 4K Wayland outputs while keeping a sleek floating pill profile.
+pub const HUD_WIDTH: u32 = 320;
 
 /// Logical height in pixels of the top-center Wayland waveform overlay capsule.
 ///
-/// Compact `50px` stadium height floats cleanly below the top screen edge on Niri.
-pub const HUD_HEIGHT: u32 = 50;
+/// Gives `48px` of vertical bar excursion so spoken syllables leap unmistakably vs silence.
+pub const HUD_HEIGHT: u32 = 62;
 
 /// Top screen margin in logical pixels applied to the top-center `zwlr_layer_surface_v1`.
 ///
-/// Leaves a `14px` breathing gap below the top edge of the monitor.
-pub const HUD_TOP_MARGIN: i32 = 14;
+/// Leaves a `16px` breathing gap below the top edge of the active monitor.
+pub const HUD_TOP_MARGIN: i32 = 16;
 
 /// Number of vertical rounded capsule bars in the live voice waveform display.
 ///
-/// At `50 FPS` (`20ms` per frame), `30` bars represent a `600ms` rolling voice history window.
-pub const WAVEFORM_BARS: usize = 30;
+/// At `50 FPS` (`20ms` per frame), `34` bars represent a `680ms` rolling voice history window.
+pub const WAVEFORM_BARS: usize = 34;
 
-/// Noise-floor offset (`0.0018`) subtracted before perceptual square-root compression.
+/// Noise-floor offset (`0.0022`) subtracted before adaptive perceptual normalization.
 ///
-/// Keeps room silence calm at the minimal idle bar height while preserving quiet speech.
-const NOISE_FLOOR_RMS: f32 = 0.0018;
+/// Keeps room silence dead-calm at minimal `4px` dots so speech creates high visual contrast.
+const NOISE_FLOOR_LEVEL: f32 = 0.0022;
 
-/// Gain multiplier (`11.0`) mapping normal laptop-mic speech RMS (`0.02..0.12`) to full scale.
+/// Minimum adaptive reference ceiling (`0.032`) for soft conversational speech.
 ///
-/// Paired with `.sqrt()` compression so conversational speech fills `45%..95%` of the HUD.
-const SPEECH_VISUAL_GAIN: f32 = 11.0;
+/// Prevents background fan hum from being amplified to full height while ensuring normal
+/// laptop-microphone speech (`0.02..0.12` blended RMS+peak) reaches `70%..100%` excursion.
+const MIN_ADAPTIVE_PEAK: f32 = 0.032;
 
-/// Fast attack smoothing weight (`0.68`) when voice energy rises.
+/// Per-frame decay (`0.992`) of the adaptive peak reference (`~2.5s` half-life at `50 FPS`).
 ///
-/// Makes vowel and consonant onsets feel instantaneous on screen.
-const LEVEL_ATTACK: f32 = 0.68;
+/// Smoothly re-sensitizes the display when transitioning from loud speech to quieter speech.
+const ADAPTIVE_PEAK_DECAY: f32 = 0.992;
 
-/// Smooth release decay (`0.78`) per `20ms` frame when voice energy drops.
+/// Fast attack smoothing weight (`0.86`) when voice energy rises.
 ///
-/// Prevents jittery single-frame dropouts between syllables.
-const LEVEL_DECAY: f32 = 0.78;
+/// Makes vowel and consonant onsets jump immediately on screen.
+const LEVEL_ATTACK: f32 = 0.86;
 
-/// Rolling waveform bar state updated at `50 FPS` while listening.
+/// Crisp release decay (`0.60`) per `20ms` frame when voice energy drops between syllables.
+///
+/// Carves deep valleys between spoken words so the scrolling waveform visibly dances.
+const LEVEL_DECAY: f32 = 0.60;
+
+/// Rolling adaptive-gain waveform bar state updated at `50 FPS` while listening.
 #[derive(Debug, Clone)]
 pub struct WaveformAnimator {
     bars: [f32; WAVEFORM_BARS],
     smoothed_level: f32,
+    adaptive_peak: f32,
 }
 
 impl Default for WaveformAnimator {
@@ -61,30 +68,33 @@ impl Default for WaveformAnimator {
 }
 
 impl WaveformAnimator {
-    /// Creates an initialized waveform animator at idle baseline.
+    /// Creates an initialized waveform animator at calm idle baseline.
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            bars: [0.08; WAVEFORM_BARS],
+            bars: [0.0; WAVEFORM_BARS],
             smoothed_level: 0.0,
+            adaptive_peak: 0.045,
         }
     }
 
-    /// Advances the scrolling waveform by one frame given raw microphone `rms` and `elapsed_secs`.
-    pub fn step(&mut self, raw_rms: f32, elapsed_secs: f32) {
-        let compressed = ((raw_rms - NOISE_FLOOR_RMS).max(0.0) * SPEECH_VISUAL_GAIN)
-            .sqrt()
-            .clamp(0.0, 1.0);
+    /// Advances the scrolling waveform by one frame given microphone `level` and `elapsed_secs`.
+    pub fn step(&mut self, raw_level: f32, _elapsed_secs: f32) {
+        let clean = (raw_level - NOISE_FLOOR_LEVEL).max(0.0);
+        self.adaptive_peak = (self.adaptive_peak * ADAPTIVE_PEAK_DECAY)
+            .max(clean)
+            .max(MIN_ADAPTIVE_PEAK);
 
-        if compressed > self.smoothed_level {
-            self.smoothed_level += (compressed - self.smoothed_level) * LEVEL_ATTACK;
+        let normalized = (clean / self.adaptive_peak).powf(0.62).clamp(0.0, 1.0);
+
+        if normalized > self.smoothed_level {
+            self.smoothed_level += (normalized - self.smoothed_level) * LEVEL_ATTACK;
         } else {
             self.smoothed_level *= LEVEL_DECAY;
         }
 
         self.bars.copy_within(1..WAVEFORM_BARS, 0);
-        let shimmer = 0.06 + 0.03 * (elapsed_secs * 6.5).sin().abs();
-        self.bars[WAVEFORM_BARS - 1] = (self.smoothed_level + shimmer).clamp(0.06, 1.0);
+        self.bars[WAVEFORM_BARS - 1] = self.smoothed_level.clamp(0.0, 1.0);
     }
 
     /// Renders the current HUD frame into a `HUD_WIDTH * HUD_HEIGHT * 4` premultiplied `ARGB8888` slice.
@@ -120,12 +130,11 @@ fn compute_bar_half_heights(
     let max_idx = (WAVEFORM_BARS - 1) as f32;
 
     for (i, &level) in bars.iter().enumerate() {
-        // Gentle edge taper at both ends so tall peaks tuck smoothly inside the stadium curve.
         let norm_pos = (i as f32) / max_idx;
-        let edge_taper = (PI * norm_pos).sin().powf(0.32).clamp(0.35, 1.0);
-        let micro_wave = 0.85 * ((elapsed_secs * 7.0) + (i as f32) * 0.55).sin().abs();
-        let half_h = 2.2 + (level * edge_taper * 15.8) + micro_wave * (0.3 + level * 0.7);
-        out[i] = half_h.clamp(2.2, 18.0);
+        let edge_taper = (PI * norm_pos).sin().powf(0.28).clamp(0.40, 1.0);
+        let idle_ripple = 0.22 * ((elapsed_secs * 5.0) + (i as f32) * 0.45).sin().abs();
+        let speech_swing = level * edge_taper * 22.5;
+        out[i] = (2.0 + speech_swing + idle_ripple).clamp(2.0, 24.5);
     }
     out
 }
@@ -147,70 +156,70 @@ fn shade_hud_pixel(
 
     let pill_alpha = smooth_coverage(d_pill);
 
-    // Base translucent dark obsidian fill (#10141EEB)
+    // Deep translucent obsidian capsule (#10141EF0)
     let mut red = 16.0_f32;
     let mut green = 20.0_f32;
     let mut blue = 30.0_f32;
-    let mut alpha = 236.0 * pill_alpha;
+    let mut alpha = 240.0 * pill_alpha;
 
-    // Anti-aliased 1.5px LCARS warm gold/amber border around the stadium perimeter
-    let border_dist = (d_pill + 0.85).abs() - 0.75;
+    // Anti-aliased 1.6px LCARS gold/amber perimeter border that brightens with voice level
+    let border_dist = (d_pill + 0.9).abs() - 0.8;
     let border_cov = smooth_coverage(border_dist) * pill_alpha;
     if border_cov > 0.0 {
         let br = 255.0;
-        let bg = 158.0 + 35.0 * voice_boost;
-        let bb = 58.0 + 40.0 * voice_boost;
-        let strength = border_cov * (0.68 + 0.30 * voice_boost);
+        let bg = 158.0 + 42.0 * voice_boost;
+        let bb = 58.0 + 50.0 * voice_boost;
+        let strength = border_cov * (0.72 + 0.28 * voice_boost);
         red = lerp(red, br, strength);
         green = lerp(green, bg, strength);
         blue = lerp(blue, bb, strength);
     }
 
-    // Left pulsing LCARS status beacon at (26.5, 25.0)
-    let dot_dist = (x - 26.5).hypot(y - cy);
-    let halo = ((1.0 - dot_dist / (11.5 + 3.0 * voice_boost)).max(0.0)).powi(2);
+    // Left pulsing LCARS status beacon at (30.0, 31.0)
+    let dot_dist = (x - 30.0).hypot(y - cy);
+    let halo = ((1.0 - dot_dist / (13.5 + 4.5 * voice_boost)).max(0.0)).powi(2);
     if halo > 0.0 {
-        red = lerp(red, 255.0, halo * (0.28 + 0.30 * pulse));
-        green = lerp(green, 110.0, halo * (0.22 + 0.25 * pulse));
+        red = lerp(red, 255.0, halo * (0.30 + 0.35 * pulse));
+        green = lerp(green, 112.0, halo * (0.24 + 0.26 * pulse));
         blue = lerp(blue, 48.0, halo * 0.18);
     }
-    let dot_radius = 4.8 + 0.8 * pulse + 1.1 * voice_boost;
+    let dot_radius = 5.5 + 0.9 * pulse + 1.8 * voice_boost;
     let dot_cov = smooth_coverage(dot_dist - dot_radius) * pill_alpha;
     if dot_cov > 0.0 {
         red = lerp(red, 255.0, dot_cov);
-        green = lerp(green, 108.0 + 52.0 * pulse, dot_cov);
-        blue = lerp(blue, 52.0, dot_cov);
+        green = lerp(green, 104.0 + 58.0 * pulse, dot_cov);
+        blue = lerp(blue, 50.0, dot_cov);
     }
 
-    // Vertical LCARS accent divider tick at x = 46.5
-    let div_d = sdf_rounded_box(x - 46.5, y - cy, 1.2, 10.5, 1.2);
-    let div_cov = smooth_coverage(div_d) * pill_alpha * 0.55;
+    // Vertical LCARS accent divider tick at x = 52.0
+    let div_d = sdf_rounded_box(x - 52.0, y - cy, 1.3, 13.0, 1.3);
+    let div_cov = smooth_coverage(div_d) * pill_alpha * 0.6;
     if div_cov > 0.0 {
         red = lerp(red, 255.0, div_cov);
-        green = lerp(green, 166.0, div_cov);
+        green = lerp(green, 168.0, div_cov);
         blue = lerp(blue, 74.0, div_cov);
     }
 
-    // 30 live scrolling waveform bars across x = 58.0 .. 252.3 (step = 6.7px)
-    if (54.0..=257.0).contains(&x) {
-        let rel_x = x - 58.0;
-        let idx = (rel_x / 6.7).round();
+    // 34 live scrolling waveform bars across x = 65.0 .. 296.0 (step = 7.0px)
+    if (61.0..=301.0).contains(&x) {
+        let rel_x = x - 65.0;
+        let idx = (rel_x / 7.0).round();
         if (0.0..(WAVEFORM_BARS as f32)).contains(&idx) {
             let bar_idx = idx as usize;
-            let bar_cx = 58.0 + (bar_idx as f32) * 6.7;
+            let bar_cx = 65.0 + (bar_idx as f32) * 7.0;
             let half_h = bar_half_heights[bar_idx];
-            let bar_d = sdf_rounded_box(x - bar_cx, y - cy, 1.85, half_h, 1.85);
+            let bar_d = sdf_rounded_box(x - bar_cx, y - cy, 2.1, half_h, 2.1);
             let bar_cov = smooth_coverage(bar_d) * pill_alpha;
             if bar_cov > 0.0 {
-                let intensity = ((half_h - 2.2) / 15.8).clamp(0.0, 1.0);
-                // Blend from LCARS sky-cyan (#58C4FF) at quiet levels to LCARS gold (#FFAE38) at peaks
+                let intensity = ((half_h - 2.0) / 22.5).clamp(0.0, 1.0);
+                // Blend from LCARS sky-cyan (#58C8FF) at quiet levels to vivid LCARS gold (#FFB43A)
                 let wr = lerp(88.0, 255.0, intensity);
-                let wg = lerp(196.0, 182.0, intensity);
+                let wg = lerp(200.0, 180.0, intensity);
                 let wb = lerp(255.0, 58.0, intensity);
                 red = lerp(red, wr, bar_cov);
                 green = lerp(green, wg, bar_cov);
                 blue = lerp(blue, wb, bar_cov);
-                alpha = alpha.max(248.0 * pill_alpha * bar_cov);
+                alpha = alpha.max(250.0 * pill_alpha * bar_cov);
             }
         }
     }
@@ -249,17 +258,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn waveform_hud_renders_transparent_corners_and_opaque_bars() {
+    fn waveform_hud_renders_transparent_corners_and_reactive_speech_bars() {
         let mut anim = WaveformAnimator::new();
-        anim.step(0.08, 0.25);
+        anim.step(0.0, 0.10);
+        let idle_level = anim.bars[WAVEFORM_BARS - 1];
+        assert!(idle_level < 0.05);
+
+        anim.step(0.05, 0.12);
+        let speech_level = anim.bars[WAVEFORM_BARS - 1];
+        assert!(
+            speech_level > 0.80,
+            "expected strong bar excursion, got {speech_level}"
+        );
 
         let mut pixels = vec![0_u8; (HUD_WIDTH * HUD_HEIGHT * 4) as usize];
-        anim.render_argb8888(&mut pixels, 0.25);
+        anim.render_argb8888(&mut pixels, 0.12);
 
-        // Top-left corner (0, 0) outside rounded stadium must be completely transparent.
         assert_eq!(&pixels[0..4], &[0, 0, 0, 0]);
 
-        // Center pixel inside stadium must have high alpha and non-zero RGB.
         let center_idx =
             (((HUD_HEIGHT as usize) / 2) * (HUD_WIDTH as usize) + ((HUD_WIDTH as usize) / 2)) * 4;
         let word = u32::from_ne_bytes([

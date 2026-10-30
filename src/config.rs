@@ -177,7 +177,7 @@ pub struct TargetConfig {
 impl Default for TargetConfig {
     fn default() -> Self {
         Self {
-            alacritty_only: true,
+            alacritty_only: false,
             strip_alacritty_enter: true,
             trailing_space: true,
             input_method: InputMethod::Type,
@@ -565,12 +565,12 @@ mod tests {
     #[test]
     fn default_config_roundtrips_toml() {
         let cfg = AppConfig::default();
-        assert!(cfg.target.alacritty_only);
+        assert!(!cfg.target.alacritty_only);
         assert!(cfg.target.strip_alacritty_enter);
         let encoded = toml::to_string_pretty(&cfg).expect("serialize default config");
         let decoded: AppConfig = toml::from_str(&encoded).expect("deserialize default config");
         assert_eq!(decoded.transcription.model, DEFAULT_MODEL);
-        assert!(decoded.target.alacritty_only);
+        assert!(!decoded.target.alacritty_only);
         assert!(decoded.target.strip_alacritty_enter);
     }
 }

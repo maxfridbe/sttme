@@ -35,7 +35,7 @@ use crate::config::{AppConfig, cache_dir, lock_file_path, socket_path};
 use crate::history::HistoryStore;
 use crate::inject::{inject_text, prepare_output_text};
 use crate::ipc::{ClientContext, DaemonStats, IpcAction, IpcRequest, IpcResponse, RecorderState};
-use crate::ptt::{EVDEV_KEY_F12, HoldOutcome, OverlayOptions, run_recording_overlay};
+use crate::ptt::{EVDEV_KEY_F10, HoldLease, HoldOutcome, OverlayOptions, run_recording_overlay};
 use crate::transcribe::{Transcriber, is_hallucination};
 use crate::window::{WindowInfo, focus_window, get_focused_window};
 
@@ -44,10 +44,10 @@ use crate::window::{WindowInfo, focus_window, get_focused_window};
 /// Matches `talktype.py`'s `HOTKEY_DEBOUNCE_MS = 300`.
 const HOTKEY_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Anti-chatter cooldown (`80ms`) after push-to-talk key release before accepting a new `Hold`.
+/// Anti-chatter cooldown (`60ms`) after push-to-talk key release before accepting a new `Hold`.
 ///
 /// Rejects mechanical switch bounce on key-up without delaying intentional back-to-back dictation.
-const RELEASE_COOLDOWN: Duration = Duration::from_millis(80);
+const RELEASE_COOLDOWN: Duration = Duration::from_millis(60);
 
 /// Minimum interval (`500ms`) between consecutive text injections to prevent double-typing.
 ///
@@ -61,7 +61,7 @@ const MAX_HTTP_AUDIO_BYTES: usize = 50 * 1024 * 1024;
 
 /// Brief settle delay (`30ms`) after compositor `FocusWindow` before emitting virtual keystrokes.
 ///
-/// Gives Niri and Alacritty one frame to route Wayland `wl_keyboard.enter` to the target surface.
+/// Gives Niri and Wayland clients one frame to route `wl_keyboard.enter` to the target surface.
 const WINDOW_FOCUS_SETTLE: Duration = Duration::from_millis(30);
 
 struct ActiveSession {
@@ -70,6 +70,7 @@ struct ActiveSession {
     client_ctx: ClientContext,
     alacritty_restricted: bool,
     abort_hold: Arc<AtomicBool>,
+    hold_lease: Option<Arc<HoldLease>>,
 }
 
 struct MutableDaemonState {
@@ -474,13 +475,20 @@ fn handle_hold_locked(
 ) -> IpcResponse {
     let model = daemon.transcriber.model_label();
     match guard.phase {
-        RecorderState::Recording => IpcResponse {
-            ok: true,
-            state: RecorderState::Recording,
-            message: "already listening while key is held".to_owned(),
-            model,
-            stats: None,
-        },
+        RecorderState::Recording => {
+            if let Some(session) = &guard.active_session
+                && let Some(lease) = &session.hold_lease
+            {
+                lease.ping();
+            }
+            IpcResponse {
+                ok: true,
+                state: RecorderState::Recording,
+                message: "listening while key is held".to_owned(),
+                model,
+                stats: None,
+            }
+        }
         RecorderState::Transcribing => IpcResponse {
             ok: false,
             state: RecorderState::Transcribing,
@@ -537,7 +545,15 @@ fn start_recording_locked(
         Ok(capture) => {
             let abort_hold = Arc::new(AtomicBool::new(false));
             let meter = capture.meter();
-            let hold_key = hold_until_release.then(|| ctx.hold_key.unwrap_or(EVDEV_KEY_F12));
+            let (hold_lease, grab_key) = if hold_until_release {
+                if ctx.grab_keyboard {
+                    (None, Some(ctx.hold_key.unwrap_or(EVDEV_KEY_F10)))
+                } else {
+                    (Some(Arc::new(HoldLease::new())), None)
+                }
+            } else {
+                (None, None)
+            };
             let show_waveform = daemon.cfg.ui.waveform_overlay;
             let wayland_display = ctx.wayland_display.clone();
 
@@ -548,6 +564,7 @@ fn start_recording_locked(
                 client_ctx: ctx,
                 alacritty_restricted,
                 abort_hold: Arc::clone(&abort_hold),
+                hold_lease: hold_lease.clone(),
             });
             daemon.beep(BeepKind::Start);
             event!(
@@ -562,7 +579,8 @@ fn start_recording_locked(
                 spawn_recording_overlay_worker(
                     Arc::clone(daemon),
                     OverlayOptions {
-                        hold_key,
+                        hold_lease,
+                        grab_key,
                         show_waveform,
                         wayland_display,
                         meter,
@@ -604,7 +622,7 @@ fn spawn_recording_overlay_worker(
     abort_hold: Arc<AtomicBool>,
 ) {
     let rt_handle = tokio::runtime::Handle::current();
-    let is_hold_mode = opts.hold_key.is_some();
+    let is_hold_mode = opts.hold_lease.is_some() || opts.grab_key.is_some();
     drop(
         std::thread::Builder::new()
             .name("sttme-hud".to_owned())
@@ -898,12 +916,18 @@ fn deliver_text_to_window(
         }
     }
 
+    let mut current_focus = get_focused_window(client_ctx.niri_socket.as_deref());
     if let Some(win) = captured_target {
-        focus_window(win, client_ctx.niri_socket.as_deref());
-        std::thread::sleep(WINDOW_FOCUS_SETTLE);
+        let already_focused = current_focus
+            .as_ref()
+            .is_some_and(|cur| cur.backend == win.backend && cur.id == win.id);
+        if !already_focused {
+            focus_window(win, client_ctx.niri_socket.as_deref());
+            std::thread::sleep(WINDOW_FOCUS_SETTLE);
+            current_focus = get_focused_window(client_ctx.niri_socket.as_deref());
+        }
     }
 
-    let current_focus = get_focused_window(client_ctx.niri_socket.as_deref());
     let is_alacritty = current_focus
         .as_ref()
         .map(WindowInfo::is_alacritty)
@@ -922,7 +946,7 @@ fn deliver_text_to_window(
     }
 
     let is_terminal = is_alacritty || current_focus.as_ref().is_some_and(WindowInfo::is_terminal);
-    let strip_enter = is_alacritty && daemon.cfg.target.strip_alacritty_enter;
+    let strip_enter = is_terminal && daemon.cfg.target.strip_alacritty_enter;
 
     let formatted = prepare_output_text(raw_text, strip_enter, daemon.cfg.target.trailing_space);
     if formatted.is_empty() {

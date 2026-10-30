@@ -444,9 +444,15 @@ fn update_meter_from_slice(meter: &WaveformMeter, mono_slice: &[f32]) {
     if mono_slice.is_empty() {
         return;
     }
-    let sum_sq: f32 = mono_slice.iter().map(|&s| s * s).sum();
+    let mut sum_sq = 0.0_f32;
+    let mut peak = 0.0_f32;
+    for &sample in mono_slice {
+        sum_sq += sample * sample;
+        peak = peak.max(sample.abs());
+    }
     let rms = (sum_sq / (mono_slice.len() as f32)).sqrt();
-    meter.record_rms(rms);
+    // Blend RMS energy with transient peak amplitude so speech syllables visibly pop.
+    meter.record_rms(0.5 * rms + 0.5 * peak);
 }
 
 /// Resamples mono `f32` audio from `in_rate` Hz to `out_rate` Hz with anti-aliased box/linear filtering.

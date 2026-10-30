@@ -1,17 +1,17 @@
 // Rust guideline compliant 2026-02-21
-//! Top-center Wayland live waveform overlay and hold-to-talk key-release watcher.
+//! Top-center Wayland live waveform overlay and hold-to-talk release tracking.
 //!
 //! Maps a double-buffered `zwlr_layer_shell_v1` `Layer::Overlay` surface anchored at the
-//! **top-center** of the active Wayland output. While `F12` is held down, this surface renders
-//! a `50 FPS` live audio waveform driven by [`WaveformMeter`] while simultaneously receiving
-//! sub-millisecond `wl_keyboard.key` release events without `/dev/input` root permissions.
+//! **top-center** of the active Wayland output (`KeyboardInteractivity::None` for global
+//! compositor keybinds so active windows never lose focus). Tracks compositor key-repeat
+//! keepalive heartbeats via [`HoldLease`] (or optional direct `wl_keyboard` release events).
 
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -32,40 +32,117 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 use crate::audio::WaveformMeter;
 use crate::waveform::{HUD_HEIGHT, HUD_TOP_MARGIN, HUD_WIDTH, WaveformAnimator};
 
+/// Linux evdev keycode for `F10` (`KEY_F10 = 68`).
+///
+/// Defined in `<linux/input-event-codes.h>`.
+pub const EVDEV_KEY_F10: u32 = 68;
+
 /// Linux evdev keycode for `F12` (`KEY_F12 = 88`).
 ///
-/// Defined in `<linux/input-event-codes.h>` and used verbatim in Wayland `wl_keyboard` events.
+/// Defined in `<linux/input-event-codes.h>`.
 pub const EVDEV_KEY_F12: u32 = 88;
 
 /// Linux evdev keycode for `Escape` (`KEY_ESC = 1`).
 ///
-/// Pressing `Esc` while holding `F12` aborts an active recording without transcribing.
+/// Pressing `Esc` while in keyboard-grab hold mode aborts recording without transcribing.
 const EVDEV_KEY_ESC: u32 = 1;
 
 /// Kernel `poll(2)` frame cadence (`20ms` = `50 FPS`) for smooth live waveform animation.
 ///
-/// Actual `wl_keyboard` release events wake `poll(2)` immediately (`< 1ms`), while the `20ms`
-/// timeout drives steady `50 FPS` waveform rendering while `F12` remains depressed.
+/// Drives steady `50 FPS` waveform rendering and checks [`HoldLease`] expiration every `20ms`.
 const WAYLAND_FRAME_SLICE: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 20_000_000,
 };
 
-/// Maximum wait (`600ms`) for the compositor to grant `wl_keyboard.enter` in `Hold` mode.
+/// Grace period (`760ms`) before the first compositor key-repeat heartbeat arrives.
 ///
-/// Niri normally focuses the overlay in `1-3ms`; if a lockscreen inhibits focus, releasing early
-/// prevents an overlay surface from lingering.
+/// Covers standard Linux XKB `repeat_delay` (`600ms` default in Niri/Smithay) plus `160ms`
+/// headroom so holding `F10` seamlessly transitions into repeat-heartbeat tracking.
+const INITIAL_HOLD_LEASE: Duration = Duration::from_millis(760);
+
+/// Lease window (`190ms`) once compositor key-repeat heartbeats (`cooldown-ms=70`) are active.
+///
+/// Gives `> 2.5x` tolerance over `70ms` repeat intervals while finishing listening within
+/// `~110ms` average the instant the user lifts their finger off `F10`.
+const ACTIVE_REPEAT_LEASE: Duration = Duration::from_millis(190);
+
+/// Minimum elapsed time (`45ms`) after initial key-down to classify a new ping as key-repeat.
+///
+/// Distinguishes genuine XKB repeats from duplicate initial key events.
+const REPEAT_CLASSIFY_THRESHOLD: Duration = Duration::from_millis(45);
+
+/// Maximum wait (`600ms`) for `wl_keyboard.enter` when explicit keyboard-grab mode is used.
 const FOCUS_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// Safety ceiling (`120s`) on a single recording session.
 ///
-/// Protects memory and disk if an object rests on `F12` or the session suspends mid-hold.
+/// Protects memory and disk if an object rests on `F10` or the session suspends mid-hold.
 const MAX_HOLD_DURATION: Duration = Duration::from_secs(120);
+
+/// Thread-safe keepalive lease refreshed by compositor key-repeat while `F10` is held down.
+#[derive(Debug)]
+pub struct HoldLease {
+    state: Mutex<LeaseTimestamps>,
+}
+
+#[derive(Debug)]
+struct LeaseTimestamps {
+    started_at: Instant,
+    last_ping_at: Instant,
+    saw_repeat: bool,
+}
+
+impl Default for HoldLease {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HoldLease {
+    /// Starts a fresh hold lease anchored at `Instant::now()`.
+    #[must_use]
+    pub fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            state: Mutex::new(LeaseTimestamps {
+                started_at: now,
+                last_ping_at: now,
+                saw_repeat: false,
+            }),
+        }
+    }
+
+    /// Refreshes the hold lease when a compositor key-repeat heartbeat arrives.
+    pub fn ping(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            let now = Instant::now();
+            if now.duration_since(guard.started_at) >= REPEAT_CLASSIFY_THRESHOLD {
+                guard.saw_repeat = true;
+            }
+            guard.last_ping_at = now;
+        }
+    }
+
+    /// Returns `true` once the user has released the held key and the lease window elapsed.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        let Ok(guard) = self.state.lock() else {
+            return true;
+        };
+        let now = Instant::now();
+        if guard.saw_repeat {
+            now.duration_since(guard.last_ping_at) >= ACTIVE_REPEAT_LEASE
+        } else {
+            now.duration_since(guard.started_at) >= INITIAL_HOLD_LEASE
+        }
+    }
+}
 
 /// Reason a Wayland recording overlay session finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldOutcome {
-    /// Push-to-talk key (`F12`) was released (or `Stop` was called); proceed with transcription.
+    /// Push-to-talk key (`F10`) was released (or `Stop` was called); proceed with transcription.
     Released,
     /// User pressed `Esc` or externally cancelled; discard captured audio.
     Cancelled,
@@ -74,17 +151,19 @@ pub enum HoldOutcome {
 /// Configuration for an active Wayland recording overlay session.
 #[derive(Debug)]
 pub struct OverlayOptions {
-    /// Optional evdev keycode (`Some(88)` in `Hold` mode; `None` in passive `Toggle` mode).
-    pub hold_key: Option<u32>,
-    /// Whether to render the visible top-center `272x50` live waveform HUD (`true` by default).
+    /// Compositor repeat-heartbeat lease for non-intrusive global hold-to-talk (`F10` in Niri).
+    pub hold_lease: Option<Arc<HoldLease>>,
+    /// Optional direct evdev keycode for `KeyboardInteractivity::Exclusive` client-bound holds.
+    pub grab_key: Option<u32>,
+    /// Whether to render the visible top-center `320x62` live waveform HUD (`true` by default).
     pub show_waveform: bool,
     /// Optional `$WAYLAND_DISPLAY` socket name from the caller's environment.
     pub wayland_display: Option<String>,
-    /// Lock-free real-time microphone RMS meter feeding the live waveform bars.
+    /// Lock-free real-time microphone meter feeding the live waveform bars.
     pub meter: Arc<WaveformMeter>,
 }
 
-/// Parses a human-friendly key name (such as `"f12"`) or numeric evdev code into an evdev keycode.
+/// Parses a human-friendly key name (such as `"f10"` or `"f12"`) or numeric evdev code.
 ///
 /// # Errors
 ///
@@ -101,7 +180,7 @@ pub fn parse_evdev_key(name: &str) -> Result<u32> {
         "f7" => 65,
         "f8" => 66,
         "f9" => 67,
-        "f10" => 68,
+        "f10" => EVDEV_KEY_F10,
         "f11" => 87,
         "f12" => EVDEV_KEY_F12,
         "capslock" | "caps_lock" => 58,
@@ -132,7 +211,7 @@ pub fn probe_wayland_layer_shell(wayland_display: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Runs the top-center Wayland live waveform overlay and optional hold-to-talk key release watch.
+/// Runs the top-center Wayland live waveform overlay and hold-to-talk release watch.
 ///
 /// # Errors
 ///
@@ -155,7 +234,7 @@ pub fn run_recording_overlay(
         .bind(&qh, 1..=4, ())
         .context("compositor missing zwlr_layer_shell_v1")?;
 
-    let keyboard = opts.hold_key.map(|_| seat.get_keyboard(&qh, ()));
+    let keyboard = opts.grab_key.map(|_| seat.get_keyboard(&qh, ()));
     let surface = compositor.create_surface(&qh, ());
     let empty_region = compositor.create_region(&qh, ());
     surface.set_input_region(Some(&empty_region));
@@ -176,18 +255,17 @@ pub fn run_recording_overlay(
         (),
     );
     layer_surface.set_size(width, height);
-    // Anchoring strictly to `Anchor::Top` centers the surface horizontally at the top of the screen.
     layer_surface.set_anchor(Anchor::Top);
     layer_surface.set_margin(top_margin, 0, 0, 0);
     layer_surface.set_exclusive_zone(-1);
-    layer_surface.set_keyboard_interactivity(if opts.hold_key.is_some() {
+    layer_surface.set_keyboard_interactivity(if opts.grab_key.is_some() {
         KeyboardInteractivity::Exclusive
     } else {
         KeyboardInteractivity::None
     });
     surface.commit();
 
-    let mut state = PttWaylandState::new(opts.hold_key);
+    let mut state = PttWaylandState::new(opts.grab_key);
     event_queue
         .roundtrip(&mut state)
         .context("Wayland layer-surface configure roundtrip failed")?;
@@ -340,10 +418,15 @@ fn animate_and_poll_loop(
         if abort_flag.load(Ordering::Relaxed) {
             return Ok(HoldOutcome::Released);
         }
+        if let Some(lease) = &opts.hold_lease
+            && lease.is_expired()
+        {
+            return Ok(HoldOutcome::Released);
+        }
         if let Some(outcome) = state.outcome {
             return Ok(outcome);
         }
-        if opts.hold_key.is_some() && !state.focused && elapsed >= FOCUS_ACQUIRE_TIMEOUT {
+        if opts.grab_key.is_some() && !state.focused && elapsed >= FOCUS_ACQUIRE_TIMEOUT {
             event!(
                 name: "ptt.focus.timeout",
                 Level::WARN,
@@ -465,7 +548,6 @@ impl Dispatch<WlKeyboard, ()> for PttWaylandState {
             wl_keyboard::Event::Enter { keys, .. } => {
                 state.focused = true;
                 if !keys_array_contains_evdev(&keys, target_key) {
-                    // Key was already released before focus transferred to the overlay.
                     state.outcome = Some(HoldOutcome::Released);
                 }
             }
@@ -502,19 +584,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_evdev_key_resolves_f12_and_numeric_codes() {
+    fn parse_evdev_key_resolves_f10_f12_and_numeric_codes() {
+        assert_eq!(parse_evdev_key("F10").expect("F10"), 68);
         assert_eq!(parse_evdev_key("F12").expect("F12"), 88);
-        assert_eq!(parse_evdev_key("f12").expect("f12"), 88);
-        assert_eq!(parse_evdev_key("88").expect("88"), 88);
+        assert_eq!(parse_evdev_key("68").expect("68"), 68);
         let _ = parse_evdev_key("not-a-key").unwrap_err();
     }
 
     #[test]
-    fn keys_array_detects_depressed_f12_evdev_code() {
+    fn keys_array_detects_depressed_f10_evdev_code() {
         let mut raw = Vec::new();
         raw.extend_from_slice(&42_u32.to_ne_bytes());
-        raw.extend_from_slice(&EVDEV_KEY_F12.to_ne_bytes());
-        assert!(keys_array_contains_evdev(&raw, EVDEV_KEY_F12));
+        raw.extend_from_slice(&EVDEV_KEY_F10.to_ne_bytes());
+        assert!(keys_array_contains_evdev(&raw, EVDEV_KEY_F10));
         assert!(!keys_array_contains_evdev(&raw, 59));
+    }
+
+    #[test]
+    fn hold_lease_stays_alive_while_pinged() {
+        let lease = HoldLease::new();
+        assert!(!lease.is_expired());
+        lease.ping();
+        assert!(!lease.is_expired());
     }
 }

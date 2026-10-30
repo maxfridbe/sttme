@@ -39,7 +39,7 @@ use crate::transcribe::{Transcriber, ensure_ggml_model};
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Push-to-talk local Whisper voice typing for Alacritty and Linux (Rust port of `TalkType`).
+/// Push-to-talk local Whisper voice typing for Wayland/Niri and Linux (Rust port of `TalkType`).
 #[derive(Debug, Parser)]
 #[command(name = "sttme", version, about)]
 struct Cli {
@@ -67,7 +67,7 @@ struct Cli {
     #[arg(long)]
     setup: bool,
 
-    /// Subcommand to execute (defaults to `toggle` for instant hotkey binding).
+    /// Subcommand to execute (defaults to `hold` on `F10` for instant hotkey binding).
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -108,17 +108,20 @@ impl TargetScope {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Listen strictly while `key` (`F12`) is held down, finishing automatically upon release.
+    /// Listen strictly while `key` (`F10`) is held down, finishing automatically upon release.
     Hold {
-        /// Key held down during dictation (e.g., `f12`, `rctrl`, `capslock`, or evdev code).
-        #[arg(short, long, default_value = "f12")]
+        /// Key held down during dictation (e.g., `f10`, `f12`, `rctrl`, `capslock`, or evdev code).
+        #[arg(short, long, default_value = "f10")]
         key: String,
         /// Target window scope (`alacritty` or `all`).
         #[arg(long, value_enum)]
         target: Option<TargetScope>,
-        /// Suppress stdout status output (ideal for terminal keybindings).
+        /// Suppress stdout status output (ideal for compositor keybindings).
         #[arg(short, long)]
         quiet: bool,
+        /// Use exclusive Wayland keyboard grab instead of compositor key-repeat lease.
+        #[arg(long)]
+        grab: bool,
     },
     /// Toggle recording on/off via the persistent daemon (auto-starts daemon if needed).
     Toggle {
@@ -193,8 +196,7 @@ enum Commands {
     Doctor,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if matches!(
@@ -216,9 +218,10 @@ async fn main() -> Result<()> {
     }
 
     let command = cli.command.unwrap_or(Commands::Hold {
-        key: "f12".to_owned(),
+        key: "f10".to_owned(),
         target: None,
         quiet: false,
+        grab: false,
     });
     execute_command(
         command,
@@ -228,10 +231,9 @@ async fn main() -> Result<()> {
         cli.language,
         cli.method,
     )
-    .await
 }
 
-async fn execute_command(
+fn execute_command(
     command: Commands,
     model: Option<String>,
     api: Option<String>,
@@ -240,42 +242,47 @@ async fn execute_command(
     method: Option<CliInputMethod>,
 ) -> Result<()> {
     match command {
-        Commands::Hold { key, target, quiet } => {
+        Commands::Hold {
+            key,
+            target,
+            quiet,
+            grab,
+        } => {
             let evdev_code = parse_evdev_key(&key)?;
             let resp = send_ipc_request(
                 &socket_path(),
                 &IpcRequest {
                     action: IpcAction::Hold,
                     context: ClientContext::from_env(target.map(|t| t.as_str().to_owned()))
-                        .with_hold_key(evdev_code),
+                        .with_hold_key(evdev_code)
+                        .with_grab_keyboard(grab),
                 },
                 true,
-            )
-            .await?;
+            )?;
             if !quiet {
                 println!("[{}] {}", resp.state, resp.message);
             }
         }
         Commands::Toggle { target, quiet } => {
-            dispatch_simple_ipc(IpcAction::Toggle, target, true, quiet).await?;
+            dispatch_simple_ipc(IpcAction::Toggle, target, true, quiet)?;
         }
         Commands::Start { target } => {
-            dispatch_simple_ipc(IpcAction::Start, target, true, false).await?;
+            dispatch_simple_ipc(IpcAction::Start, target, true, false)?;
         }
         Commands::Stop => {
-            dispatch_simple_ipc(IpcAction::Stop, None, false, false).await?;
+            dispatch_simple_ipc(IpcAction::Stop, None, false, false)?;
         }
         Commands::Cancel => {
-            dispatch_simple_ipc(IpcAction::Cancel, None, false, false).await?;
+            dispatch_simple_ipc(IpcAction::Cancel, None, false, false)?;
         }
         Commands::Recover { target } => {
-            dispatch_simple_ipc(IpcAction::Recover, target, true, false).await?;
+            dispatch_simple_ipc(IpcAction::Recover, target, true, false)?;
         }
         Commands::Retry { target } => {
-            dispatch_simple_ipc(IpcAction::Retry, target, true, false).await?;
+            dispatch_simple_ipc(IpcAction::Retry, target, true, false)?;
         }
         Commands::Status => {
-            print_daemon_status().await?;
+            print_daemon_status()?;
         }
         Commands::Shutdown => {
             let resp = send_ipc_request(
@@ -285,26 +292,31 @@ async fn execute_command(
                     context: ClientContext::from_env(None),
                 },
                 false,
-            )
-            .await?;
+            )?;
             println!("{}", resp.message);
         }
         Commands::Daemon { http_port, host } => {
             let cfg = apply_cli_overrides(load_config()?, model, api, api_model, language, method);
-            run_daemon(cfg, http_port.map(|port| SocketAddr::new(host, port))).await?;
+            run_in_tokio(run_daemon(
+                cfg,
+                http_port.map(|port| SocketAddr::new(host, port)),
+            ))?;
         }
         Commands::Serve { port, host } => {
             let cfg = apply_cli_overrides(load_config()?, model, api, api_model, language, method);
-            run_daemon(cfg, Some(SocketAddr::new(host, port))).await?;
+            run_in_tokio(run_daemon(cfg, Some(SocketAddr::new(host, port))))?;
         }
         Commands::Transcribe { file, strip_enter } => {
             let cfg = apply_cli_overrides(load_config()?, model, api, api_model, language, method);
-            run_file_transcription(&cfg, &file, strip_enter).await?;
+            run_in_tokio(run_file_transcription(&cfg, &file, strip_enter))?;
         }
         Commands::DownloadModel { model_name } => {
-            let client = reqwest::Client::new();
-            let path = ensure_ggml_model(&model_name, &client).await?;
-            println!("Model ready at {}", path.display());
+            run_in_tokio(async move {
+                let client = reqwest::Client::new();
+                let path = ensure_ggml_model(&model_name, &client).await?;
+                println!("Model ready at {}", path.display());
+                Ok(())
+            })?;
         }
         Commands::Setup => {
             run_setup_wizard()?;
@@ -316,7 +328,18 @@ async fn execute_command(
     Ok(())
 }
 
-async fn dispatch_simple_ipc(
+fn run_in_tokio<F>(fut: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize Tokio runtime")?;
+    runtime.block_on(fut)
+}
+
+fn dispatch_simple_ipc(
     action: IpcAction,
     target: Option<TargetScope>,
     autostart: bool,
@@ -329,15 +352,14 @@ async fn dispatch_simple_ipc(
             context: ClientContext::from_env(target.map(|t| t.as_str().to_owned())),
         },
         autostart,
-    )
-    .await?;
+    )?;
     if !quiet {
         println!("[{}] {}", resp.state, resp.message);
     }
     Ok(())
 }
 
-async fn print_daemon_status() -> Result<()> {
+fn print_daemon_status() -> Result<()> {
     let resp = send_ipc_request(
         &socket_path(),
         &IpcRequest {
@@ -345,8 +367,7 @@ async fn print_daemon_status() -> Result<()> {
             context: ClientContext::from_env(None),
         },
         false,
-    )
-    .await?;
+    )?;
     println!("State:  {}", resp.state);
     println!("Model:  {}", resp.model);
     println!("Detail: {}", resp.message);
