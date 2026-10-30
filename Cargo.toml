@@ -5,8 +5,9 @@ edition = "2024"
 description = "Instant push-to-talk local Whisper speech-to-text daemon and CLI (Rust port of TalkType)"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/lmacan1/talktype"
-keywords = ["whisper", "speech-to-text", "wayland", "alacritty", "dictation"]
+homepage = "https://github.com/maxfridbe/sttme"
+repository = "https://github.com/maxfridbe/sttme"
+keywords = ["whisper", "speech-to-text", "wayland", "niri", "dictation"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]

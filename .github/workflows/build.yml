@@ -1,0 +1,175 @@
+name: Build & Release Linux Binaries
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Lint, Test & ShellCheck
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            clang \
+            libclang-dev \
+            pkg-config \
+            libasound2-dev \
+            x11-xkb-utils \
+            xkb-data \
+            shellcheck
+
+      - name: Validate install scripts with ShellCheck
+        run: |
+          shellcheck install.sh uninstall.sh
+          bash -n install.sh uninstall.sh
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy lints
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+  build-linux:
+    name: Build Linux (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            cmake_flags: "-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            cmake_flags: "-DGGML_NATIVE=OFF"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            clang \
+            libclang-dev \
+            pkg-config \
+            libasound2-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and release target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+
+      - name: Build optimized release binary
+        env:
+          CMAKE_ARGS: ${{ matrix.cmake_flags }}
+        run: cargo build --release --locked
+
+      - name: Smoke-test compiled binary
+        run: |
+          ./target/release/sttme --version
+          ./target/release/sttme --help >/dev/null
+          ldd ./target/release/sttme
+
+      - name: Package release archive and SHA-256 checksum
+        run: |
+          STAGE_DIR="dist/sttme-linux-${{ matrix.arch }}"
+          ARCHIVE="dist/sttme-linux-${{ matrix.arch }}.tar.gz"
+          mkdir -p "${STAGE_DIR}"
+          install -Dm0755 target/release/sttme "${STAGE_DIR}/sttme"
+          install -Dm0755 install.sh "${STAGE_DIR}/install.sh"
+          install -Dm0755 uninstall.sh "${STAGE_DIR}/uninstall.sh"
+          install -Dm0644 README.md "${STAGE_DIR}/README.md"
+          install -Dm0644 LICENSE "${STAGE_DIR}/LICENSE"
+          tar -C "${STAGE_DIR}" -czf "${ARCHIVE}" \
+            sttme install.sh uninstall.sh README.md LICENSE
+          (
+            cd dist
+            sha256sum "sttme-linux-${{ matrix.arch }}.tar.gz" > "sttme-linux-${{ matrix.arch }}.tar.gz.sha256"
+          )
+
+      - name: Upload Linux release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sttme-linux-${{ matrix.arch }}
+          path: |
+            dist/sttme-linux-${{ matrix.arch }}.tar.gz
+            dist/sttme-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build-linux
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download built Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS and standalone installer
+        run: |
+          cp install.sh release-assets/install.sh
+          cp uninstall.sh release-assets/uninstall.sh
+          chmod +x release-assets/install.sh release-assets/uninstall.sh
+          (
+            cd release-assets
+            cat sttme-linux-*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/sttme-linux-x86_64.tar.gz
+            release-assets/sttme-linux-aarch64.tar.gz
+            release-assets/SHA256SUMS
+            release-assets/install.sh
+            release-assets/uninstall.sh
