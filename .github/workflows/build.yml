@@ -269,6 +269,7 @@ jobs:
         with:
           name: sttme-windows-x86_64
           path: |
+            target/release/sttme.exe
             dist/sttme-windows-x86_64.zip
             dist/sttme-windows-x86_64.zip.sha256
           if-no-files-found: error
@@ -289,9 +290,8 @@ jobs:
 
       - name: Build Inno Setup installer via Docker
         run: |
-          if [[ -f dist/sttme-windows-x86_64/sttme-windows-x86_64.zip ]]; then
-            unzip -o dist/sttme-windows-x86_64/sttme-windows-x86_64.zip -d dist/sttme-windows-x86_64/
-          fi
+          mkdir -p dist/sttme-windows-x86_64
+          chmod -R 777 dist
           ./packaging/windows/build-installer.sh "${STTME_VERSION}"
 
       - name: Upload Windows setup installer artifact

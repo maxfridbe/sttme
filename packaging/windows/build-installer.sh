@@ -35,7 +35,31 @@ else
   EXTRA_ARGS+=("-v" "${REPO_ROOT}:/work")
 fi
 
-mkdir -p "${REPO_ROOT}/dist"
+mkdir -p "${REPO_ROOT}/dist/sttme-windows-x86_64"
+
+# Ensure sttme.exe exists in the expected stage path
+if [[ ! -f "${REPO_ROOT}/dist/sttme-windows-x86_64/sttme.exe" ]]; then
+  echo "==> Locating sttme.exe or release zip..."
+  FOUND_EXE=$(find "${REPO_ROOT}" -name "sttme.exe" -not -path "*/target/debug/*" | head -n1 || true)
+  if [[ -n "${FOUND_EXE}" && -f "${FOUND_EXE}" ]]; then
+    echo "Found executable at ${FOUND_EXE}"
+    cp "${FOUND_EXE}" "${REPO_ROOT}/dist/sttme-windows-x86_64/sttme.exe"
+  else
+    FOUND_ZIP=$(find "${REPO_ROOT}" -name "sttme-windows-*.zip" | head -n1 || true)
+    if [[ -n "${FOUND_ZIP}" && -f "${FOUND_ZIP}" ]]; then
+      echo "Extracting from archive ${FOUND_ZIP}"
+      unzip -o "${FOUND_ZIP}" -d "${REPO_ROOT}/dist/sttme-windows-x86_64/"
+    fi
+  fi
+fi
+
+if [[ ! -f "${REPO_ROOT}/dist/sttme-windows-x86_64/sttme.exe" ]]; then
+  echo "Error: sttme.exe not found in ${REPO_ROOT}/dist/sttme-windows-x86_64/" >&2
+  exit 1
+fi
+
+# Ensure container user (xclient: uid=1000) can write build outputs to dist
+chmod -R 777 "${REPO_ROOT}/dist"
 
 "${CONTAINER_CMD}" run --rm \
   "${EXTRA_ARGS[@]}" \
