@@ -34,15 +34,24 @@ Hold down **`F10`** in any window, speak while watching a live `50 FPS` top-cent
 
 ### Windows 10 / 11 (System Tray App)
 
-Run this one-liner in **PowerShell** to download the latest SHA-256 verified `sttme-windows-x86_64.zip` release, cache the `base` Whisper model (`~147 MB`), enable **Launch at Windows Sign-In**, and start `sttme.exe` in your System Tray:
+#### 1. Graphical Installer (Recommended)
+Download and run [**`sttme-windows-x86_64-setup.exe`**](https://github.com/maxfridbe/sttme/releases/latest) from GitHub Releases:
+- Installs to `%LOCALAPPDATA%\Programs\sttme` (no Administrator / UAC prompt required)
+- Creates Start Menu & optional Desktop shortcuts
+- Optionally enables **Launch at Windows Sign-In**
+- Optionally adds `sttme` to User `PATH` for Command Prompt / PowerShell CLI access
+- Built in CI via Docker using Inno Setup 6
+
+#### 2. One-Line PowerShell Installer
+Alternatively, install directly via PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/maxfridbe/sttme/main/install.ps1 | iex
 ```
 
-Or download **`sttme-windows-x86_64.zip`** directly from [**GitHub Releases**](https://github.com/maxfridbe/sttme/releases), extract it anywhere, and either run `sttme.exe` portably or run `.\install.ps1`.
+Or download **`sttme-windows-x86_64.zip`** directly from [**GitHub Releases**](https://github.com/maxfridbe/sttme/releases) for a portable standalone binary.
 
-Uninstall on Windows anytime:
+Uninstall on Windows anytime via **Windows Settings → Apps → Installed apps → sttme → Uninstall**, or run:
 
 ```powershell
 irm https://raw.githubusercontent.com/maxfridbe/sttme/main/uninstall.ps1 | iex

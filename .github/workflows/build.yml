@@ -51,8 +51,8 @@ jobs:
 
       - name: Validate Linux install scripts with ShellCheck
         run: |
-          shellcheck install.sh uninstall.sh
-          bash -n install.sh uninstall.sh
+          shellcheck install.sh uninstall.sh packaging/windows/build-installer.sh
+          bash -n install.sh uninstall.sh packaging/windows/build-installer.sh
 
       - name: Validate Windows PowerShell installer syntax
         shell: pwsh
@@ -273,11 +273,42 @@ jobs:
             dist/sttme-windows-x86_64.zip.sha256
           if-no-files-found: error
 
+  package-windows-installer:
+    name: Package Windows Inno Setup Installer (Docker)
+    needs: build-windows
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Windows binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sttme-windows-x86_64
+          path: dist/sttme-windows-x86_64
+
+      - name: Build Inno Setup installer via Docker
+        run: |
+          if [[ -f dist/sttme-windows-x86_64/sttme-windows-x86_64.zip ]]; then
+            unzip -o dist/sttme-windows-x86_64/sttme-windows-x86_64.zip -d dist/sttme-windows-x86_64/
+          fi
+          ./packaging/windows/build-installer.sh "${STTME_VERSION}"
+
+      - name: Upload Windows setup installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sttme-windows-setup
+          path: |
+            dist/sttme-windows-x86_64-setup.exe
+            dist/sttme-windows-x86_64-setup.exe.sha256
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     needs:
       - build-linux
       - build-windows
+      - package-windows-installer
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -310,9 +341,10 @@ jobs:
         with:
           generate_release_notes: true
           files: |
+            release-assets/sttme-windows-x86_64-setup.exe
+            release-assets/sttme-windows-x86_64.zip
             release-assets/sttme-linux-x86_64.tar.gz
             release-assets/sttme-linux-aarch64.tar.gz
-            release-assets/sttme-windows-x86_64.zip
             release-assets/SHA256SUMS
             release-assets/install.sh
             release-assets/uninstall.sh

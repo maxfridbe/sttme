@@ -1,6 +1,6 @@
 [package]
 name = "sttme"
-version = "26.1029.1"
+version = "26.1030.1"
 edition = "2024"
 description = "Instant hold-to-talk local Whisper speech-to-text daemon, Windows tray app, and CLI (Rust port of TalkType)"
 license = "MIT"
