@@ -325,6 +325,8 @@ jobs:
 
       - name: Assemble SHA256SUMS and standalone installers
         run: |
+          # Flatten any nested directory structures created by download-artifact
+          find release-assets -mindepth 2 -type f -exec mv -t release-assets {} +
           cp install.sh release-assets/install.sh
           cp uninstall.sh release-assets/uninstall.sh
           cp install.ps1 release-assets/install.ps1
