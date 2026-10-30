@@ -8,6 +8,10 @@
 
 Hold down a global hotkey (`F10`), speak while watching a live `50 FPS` top-center Wayland waveform HUD, and release the key to transcribe locally with `whisper.cpp` and type directly into whichever window is focused—with **sub-millisecond startup** and **zero focus stealing**.
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="sttme top-center Wayland live speech waveform HUD over Niri desktop" width="100%">
+</p>
+
 ---
 
 ## Features
