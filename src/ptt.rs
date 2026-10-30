@@ -398,9 +398,10 @@ fn animate_and_poll_loop(
         let elapsed = now.duration_since(started);
 
         if opts.show_waveform && now.duration_since(last_render) >= Duration::from_millis(18) {
-            let rms = opts.meter.take_rms();
             let secs = elapsed.as_secs_f32();
-            animator.step(rms, secs);
+            if let Some(level) = opts.meter.take_rms() {
+                animator.step(level, secs);
+            }
             animator.render_argb8888(&mut double_buf.scratch, secs);
             double_buf.present_frame(surface)?;
             last_render = now;

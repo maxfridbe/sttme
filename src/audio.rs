@@ -81,6 +81,26 @@ const BEEP_FADE_SECONDS: f32 = 0.005;
 /// the ALSA / `PipeWire` hardware ring buffer.
 const OUTPUT_DRAIN_MARGIN: Duration = Duration::from_millis(50);
 
+/// Cutoff frequency (`85 Hz`) of the 1st-order DC-blocking high-pass filter applied to mic input.
+///
+/// Strips hardware MEMS/PDM ADC DC bias (often `~0.11` full-scale on laptop array mics) and
+/// sub-bass rumble while passing the full human speech band (`85..8,000 Hz`) untouched.
+const MIC_HPF_CUTOFF_HZ: f32 = 85.0;
+
+/// Initial microphone settle mute window (`40ms`) when opening a capture stream.
+///
+/// Suppresses the hardware codec charge-pump step transient (`~0.45` full-scale pop) that occurs
+/// when `PipeWire` / ALSA wakes a suspended laptop array microphone.
+const MIC_WAKEUP_MUTE_MS: u32 = 40;
+
+/// Smooth raised-cosine fade-in duration (`25ms`) immediately following [`MIC_WAKEUP_MUTE_MS`].
+///
+/// Prevents a step discontinuity click when unmuting the DC-blocked microphone stream.
+const MIC_WAKEUP_RAMP_MS: u32 = 25;
+
+/// Sentinel bit-pattern stored in [`WaveformMeter`] when no new audio slice arrived yet.
+const EMPTY_METER_BITS: u32 = u32::MAX;
+
 /// Audio feedback cues played during recording and transcription lifecycle events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeepKind {
@@ -92,38 +112,103 @@ pub enum BeepKind {
     Error,
 }
 
-/// Lock-free real-time microphone RMS meter shared with the Wayland waveform overlay.
-#[derive(Debug, Default)]
+/// First-order DC-blocking high-pass filter and codec wakeup pop suppressor for mic capture.
+#[derive(Debug, Clone)]
+struct MicConditioner {
+    alpha: f32,
+    prev_x: Option<f32>,
+    prev_y: f32,
+    sample_index: usize,
+    mute_samples: usize,
+    ramp_samples: usize,
+}
+
+impl MicConditioner {
+    fn for_sample_rate(sample_rate: u32) -> Self {
+        let sr = (sample_rate.max(1)) as f32;
+        let rc_dt = 2.0 * PI * MIC_HPF_CUTOFF_HZ / sr;
+        let alpha = 1.0 / (1.0 + rc_dt);
+        let mute_samples = ((sample_rate as usize) * (MIC_WAKEUP_MUTE_MS as usize)) / 1000;
+        let ramp_samples = ((sample_rate as usize) * (MIC_WAKEUP_RAMP_MS as usize))
+            .div_ceil(1000)
+            .max(1);
+        Self {
+            alpha,
+            prev_x: None,
+            prev_y: 0.0,
+            sample_index: 0,
+            mute_samples,
+            ramp_samples,
+        }
+    }
+
+    fn process(&mut self, raw: f32) -> f32 {
+        let prev_x = self.prev_x.unwrap_or(raw);
+        let y = self.alpha * (self.prev_y + raw - prev_x);
+        self.prev_x = Some(raw);
+        self.prev_y = y;
+
+        let idx = self.sample_index;
+        self.sample_index = self.sample_index.saturating_add(1);
+
+        let gain = if idx < self.mute_samples {
+            0.0
+        } else if idx < self.mute_samples + self.ramp_samples {
+            let ramp_pos = (idx - self.mute_samples) as f32 / (self.ramp_samples as f32);
+            0.5 * (1.0 - (PI * ramp_pos).cos())
+        } else {
+            1.0
+        };
+        y * gain
+    }
+}
+
+/// Lock-free real-time microphone AC envelope meter shared with the Wayland waveform overlay.
+#[derive(Debug)]
 pub struct WaveformMeter {
     peak_rms_bits: AtomicU32,
 }
 
+impl Default for WaveformMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WaveformMeter {
-    /// Creates a zeroed real-time audio level meter.
+    /// Creates an empty real-time audio level meter.
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            peak_rms_bits: AtomicU32::new(0),
+            peak_rms_bits: AtomicU32::new(EMPTY_METER_BITS),
         }
     }
 
-    /// Publishes an RMS reading from the real-time audio callback without locking.
+    /// Publishes an AC envelope reading from the real-time audio callback without locking.
     pub fn record_rms(&self, rms: f32) {
-        if !rms.is_finite() || rms <= 0.0 {
+        if !rms.is_finite() || rms < 0.0 {
             return;
         }
         let _ =
             self.peak_rms_bits
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev_bits| {
-                    let prev = f32::from_bits(prev_bits);
-                    Some(prev.max(rms).to_bits())
+                    if prev_bits == EMPTY_METER_BITS {
+                        Some(rms.to_bits())
+                    } else {
+                        let prev = f32::from_bits(prev_bits);
+                        Some(prev.max(rms).to_bits())
+                    }
                 });
     }
 
-    /// Atomically reads and resets the peak RMS accumulated since the previous UI frame.
+    /// Atomically reads and resets the peak AC level accumulated since the previous UI frame.
+    ///
+    /// Returns `None` if no new audio packet arrived since the prior call, preventing false zero
+    /// dropouts when UI frames and audio packets straddle a scheduling boundary.
     #[must_use]
-    pub fn take_rms(&self) -> f32 {
-        f32::from_bits(self.peak_rms_bits.swap(0, Ordering::Relaxed))
+    pub fn take_rms(&self) -> Option<f32> {
+        let bits = self.peak_rms_bits.swap(EMPTY_METER_BITS, Ordering::Relaxed);
+        (bits != EMPTY_METER_BITS).then(|| f32::from_bits(bits))
     }
 }
 
@@ -249,14 +334,21 @@ fn run_cpal_input_worker(
     let raw_mono: Arc<Mutex<Vec<f32>>> =
         Arc::new(Mutex::new(Vec::with_capacity((in_rate as usize) * 10)));
 
-    let stream =
-        match build_cpal_input_stream(&device, sample_format, config, channels, &raw_mono, meter) {
-            Ok(s) => s,
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-                return Vec::new();
-            }
-        };
+    let stream = match build_cpal_input_stream(
+        &device,
+        sample_format,
+        config,
+        in_rate,
+        channels,
+        &raw_mono,
+        meter,
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return Vec::new();
+        }
+    };
 
     if let Err(err) = stream.play() {
         let _ = ready_tx.send(Err(anyhow::Error::new(err)));
@@ -278,12 +370,14 @@ fn build_cpal_input_stream(
     device: &cpal::Device,
     sample_format: SampleFormat,
     config: StreamConfig,
+    in_rate: u32,
     channels: usize,
     raw_mono: &Arc<Mutex<Vec<f32>>>,
     meter: &Arc<WaveformMeter>,
 ) -> Result<cpal::Stream> {
     let raw_clone = Arc::clone(raw_mono);
     let meter_clone = Arc::clone(meter);
+    let mut conditioner = MicConditioner::for_sample_rate(in_rate);
     let err_fn = |err| {
         event!(
             name: "audio.stream.error",
@@ -296,16 +390,30 @@ fn build_cpal_input_stream(
     let stream_res = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
             config,
-            move |data: &[f32], _| push_mono_f32(&raw_clone, &meter_clone, data, channels),
+            move |data: &[f32], _| {
+                push_mono_mapped(
+                    &raw_clone,
+                    &meter_clone,
+                    &mut conditioner,
+                    data,
+                    channels,
+                    |s| s,
+                );
+            },
             err_fn,
             None,
         ),
         SampleFormat::I16 => device.build_input_stream(
             config,
             move |data: &[i16], _| {
-                push_mono_mapped(&raw_clone, &meter_clone, data, channels, |s| {
-                    f32::from(s) / 32_768.0
-                });
+                push_mono_mapped(
+                    &raw_clone,
+                    &meter_clone,
+                    &mut conditioner,
+                    data,
+                    channels,
+                    |s| f32::from(s) / 32_768.0,
+                );
             },
             err_fn,
             None,
@@ -313,9 +421,14 @@ fn build_cpal_input_stream(
         SampleFormat::I32 => device.build_input_stream(
             config,
             move |data: &[i32], _| {
-                push_mono_mapped(&raw_clone, &meter_clone, data, channels, |s| {
-                    (s as f32) / 2_147_483_648.0
-                });
+                push_mono_mapped(
+                    &raw_clone,
+                    &meter_clone,
+                    &mut conditioner,
+                    data,
+                    channels,
+                    |s| (s as f32) / 2_147_483_648.0,
+                );
             },
             err_fn,
             None,
@@ -323,9 +436,14 @@ fn build_cpal_input_stream(
         SampleFormat::U16 => device.build_input_stream(
             config,
             move |data: &[u16], _| {
-                push_mono_mapped(&raw_clone, &meter_clone, data, channels, |s| {
-                    (f32::from(s) - 32_768.0) / 32_768.0
-                });
+                push_mono_mapped(
+                    &raw_clone,
+                    &meter_clone,
+                    &mut conditioner,
+                    data,
+                    channels,
+                    |s| (f32::from(s) - 32_768.0) / 32_768.0,
+                );
             },
             err_fn,
             None,
@@ -336,23 +454,46 @@ fn build_cpal_input_stream(
     stream_res.map_err(anyhow::Error::new)
 }
 
-fn start_pw_stream_capture(meter: &Arc<WaveformMeter>) -> Result<CaptureBackend> {
-    let mut child = Command::new("pw-record")
-        .args([
-            "--raw",
-            "--rate",
-            "16000",
-            "--channels",
-            "1",
-            "--format",
-            "s16",
-            "-",
-        ])
+fn spawn_unbuffered_pw_record() -> Result<Child> {
+    const PW_ARGS: [&str; 10] = [
+        "--latency",
+        "10ms",
+        "--raw",
+        "--rate",
+        "16000",
+        "--channels",
+        "1",
+        "--format",
+        "s16",
+        "-",
+    ];
+
+    // `pw-record ... -` uses libc `FILE *stdout`, which buffers 4,096 bytes (128ms at 16 kHz)
+    // when attached to a pipe. `stdbuf -o0` disables stdio buffering so PipeWire delivers ~5ms
+    // slices immediately for true syllable-level waveform spikes.
+    if let Ok(child) = Command::new("stdbuf")
+        .arg("-o0")
+        .arg("pw-record")
+        .args(PW_ARGS)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to spawn `pw-record`")?;
+    {
+        return Ok(child);
+    }
+
+    Command::new("pw-record")
+        .args(PW_ARGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn `pw-record`")
+}
+
+fn start_pw_stream_capture(meter: &Arc<WaveformMeter>) -> Result<CaptureBackend> {
+    let mut child = spawn_unbuffered_pw_record()?;
 
     let mut stdout = child
         .stdout
@@ -364,8 +505,9 @@ fn start_pw_stream_capture(meter: &Arc<WaveformMeter>) -> Result<CaptureBackend>
         .name("sttme-pw-in".to_owned())
         .spawn(move || {
             let mut samples = Vec::with_capacity((WHISPER_SAMPLE_RATE as usize) * 10);
-            // 320 bytes = 160 i16 samples = 10ms frame at 16,000 Hz for responsive 50 FPS metering.
-            let mut raw_buf = [0_u8; 640];
+            let mut conditioner = MicConditioner::for_sample_rate(WHISPER_SAMPLE_RATE);
+            // 256 bytes = 128 i16 samples = 8ms max slice at 16,000 Hz for crisp 50 FPS spikes.
+            let mut raw_buf = [0_u8; 256];
             let mut carry_byte: Option<u8> = None;
 
             while let Ok(read_n) = stdout.read(&mut raw_buf) {
@@ -377,14 +519,14 @@ fn start_pw_stream_capture(meter: &Arc<WaveformMeter>) -> Result<CaptureBackend>
                 if let Some(prev) = carry_byte.take()
                     && let Some((&first, rest)) = slice.split_first()
                 {
-                    let sample = i16::from_le_bytes([prev, first]);
-                    samples.push(f32::from(sample) / 32_768.0);
+                    let raw = f32::from(i16::from_le_bytes([prev, first])) / 32_768.0;
+                    samples.push(conditioner.process(raw));
                     slice = rest;
                 }
                 let (pairs, rem) = slice.as_chunks::<2>();
                 for &pair in pairs {
-                    let sample = i16::from_le_bytes(pair);
-                    samples.push(f32::from(sample) / 32_768.0);
+                    let raw = f32::from(i16::from_le_bytes(pair)) / 32_768.0;
+                    samples.push(conditioner.process(raw));
                 }
                 if let Some(&leftover) = rem.first() {
                     carry_byte = Some(leftover);
@@ -401,26 +543,10 @@ fn start_pw_stream_capture(meter: &Arc<WaveformMeter>) -> Result<CaptureBackend>
     })
 }
 
-fn push_mono_f32(buf: &Mutex<Vec<f32>>, meter: &WaveformMeter, data: &[f32], channels: usize) {
-    let Ok(mut guard) = buf.lock() else {
-        return;
-    };
-    let start_len = guard.len();
-    if channels == 1 {
-        guard.extend_from_slice(data);
-    } else {
-        let inv = 1.0 / (channels as f32);
-        for frame in data.chunks_exact(channels) {
-            let sum: f32 = frame.iter().copied().sum();
-            guard.push(sum * inv);
-        }
-    }
-    update_meter_from_slice(meter, &guard[start_len..]);
-}
-
 fn push_mono_mapped<T: Copy>(
     buf: &Mutex<Vec<f32>>,
     meter: &WaveformMeter,
+    conditioner: &mut MicConditioner,
     data: &[T],
     channels: usize,
     to_f32: impl Fn(T) -> f32,
@@ -435,7 +561,7 @@ fn push_mono_mapped<T: Copy>(
         for &sample in frame {
             sum += to_f32(sample);
         }
-        guard.push(sum * inv);
+        guard.push(conditioner.process(sum * inv));
     }
     update_meter_from_slice(meter, &guard[start_len..]);
 }
@@ -451,8 +577,8 @@ fn update_meter_from_slice(meter: &WaveformMeter, mono_slice: &[f32]) {
         peak = peak.max(sample.abs());
     }
     let rms = (sum_sq / (mono_slice.len() as f32)).sqrt();
-    // Blend RMS energy with transient peak amplitude so speech syllables visibly pop.
-    meter.record_rms(0.5 * rms + 0.5 * peak);
+    // Combine AC RMS energy with transient peak amplitude so plosives and vowels spike crisply.
+    meter.record_rms(0.60 * rms + 0.40 * peak);
 }
 
 /// Resamples mono `f32` audio from `in_rate` Hz to `out_rate` Hz with anti-aliased box/linear filtering.
@@ -843,5 +969,32 @@ mod tests {
         assert_eq!(done_rate, 48_000);
         assert!(done_pcm.len() > 30_000);
         assert!(done_pcm.iter().any(|&s| s.abs() > 0.05));
+    }
+
+    #[test]
+    fn mic_conditioner_strips_dc_bias_and_wakeup_pop_while_passing_voice() {
+        let mut cond = MicConditioner::for_sample_rate(WHISPER_SAMPLE_RATE);
+        // Simulate -0.42 wakeup pop followed by +0.115 static DC offset in silence.
+        for i in 0..4_000 {
+            let raw = if i < 320 { -0.42 } else { 0.115 };
+            let out = cond.process(raw);
+            if i < 640 {
+                assert!(out.abs() < f32::EPSILON);
+            } else if i > 2_500 {
+                assert!(out.abs() < 0.001, "expected DC stripped, got {out}");
+            }
+        }
+
+        // Simulate 250 Hz voice on top of +0.115 DC bias.
+        let mut voice_peak = 0.0_f32;
+        for i in 0..1_600 {
+            let voice = 0.08 * (2.0 * PI * 250.0 * (i as f32) / 16_000.0).sin();
+            let out = cond.process(0.115 + voice);
+            voice_peak = voice_peak.max(out.abs());
+        }
+        assert!(
+            voice_peak > 0.06,
+            "expected voice amplitude preserved, got {voice_peak}"
+        );
     }
 }

@@ -1,11 +1,9 @@
 // Rust guideline compliant 2026-02-21
 //! Anti-aliased top-center Wayland `ARGB8888` live voice waveform HUD renderer.
 //!
-//! Renders a translucent rounded LCARS capsule (`320x62`) with a pulsing recording beacon
-//! and `34` real-time adaptive-gain scrolling voice waveform bars using signed-distance-field
-//! (`SDF`) sub-pixel anti-aliasing and premultiplied alpha.
-
-use std::f32::consts::PI;
+//! Renders a translucent rounded LCARS capsule (`320x62`) with a recording status beacon
+//! and `34` real-time scrolling voice waveform bars driven strictly by DC-blocked microphone
+//! syllable spikes using signed-distance-field (`SDF`) anti-aliasing and premultiplied alpha.
 
 /// Logical width in pixels of the top-center Wayland waveform overlay capsule.
 ///
@@ -24,36 +22,44 @@ pub const HUD_TOP_MARGIN: i32 = 16;
 
 /// Number of vertical rounded capsule bars in the live voice waveform display.
 ///
-/// At `50 FPS` (`20ms` per frame), `34` bars represent a `680ms` rolling voice history window.
+/// At `50 FPS` (`20ms` per frame), `34` bars represent a `680ms` rolling voice oscilloscope trace.
 pub const WAVEFORM_BARS: usize = 34;
 
-/// Noise-floor offset (`0.0022`) subtracted before adaptive perceptual normalization.
+/// Noise-floor gate (`0.0038`) subtracted from DC-blocked AC microphone level.
 ///
-/// Keeps room silence dead-calm at minimal `4px` dots so speech creates high visual contrast.
-const NOISE_FLOOR_LEVEL: f32 = 0.0022;
+/// Measured quiet-room AC noise sits at `0.0008..0.0023`, so `0.0038` keeps room silence
+/// completely motionless at flat `4px` dots with zero synthetic movement.
+const NOISE_FLOOR_LEVEL: f32 = 0.0038;
 
-/// Minimum adaptive reference ceiling (`0.032`) for soft conversational speech.
+/// Minimum adaptive reference ceiling (`0.042`) for normal conversational speech.
 ///
-/// Prevents background fan hum from being amplified to full height while ensuring normal
-/// laptop-microphone speech (`0.02..0.12` blended RMS+peak) reaches `70%..100%` excursion.
-const MIN_ADAPTIVE_PEAK: f32 = 0.032;
+/// Prevents quiet room noise from being magnified while letting conversational syllables reach
+/// tall, dramatic spikes.
+const MIN_ADAPTIVE_PEAK: f32 = 0.042;
 
-/// Per-frame decay (`0.992`) of the adaptive peak reference (`~2.5s` half-life at `50 FPS`).
+/// Upper bound (`0.22`) on [`WaveformAnimator::adaptive_peak`].
 ///
-/// Smoothly re-sensitizes the display when transitioning from loud speech to quieter speech.
-const ADAPTIVE_PEAK_DECAY: f32 = 0.992;
+/// Ensures a brief loud spike (desk tap, cough, or speaker cue) never desensitizes subsequent
+/// normal speech.
+const MAX_ADAPTIVE_PEAK: f32 = 0.22;
 
-/// Fast attack smoothing weight (`0.86`) when voice energy rises.
+/// Per-frame decay (`0.975`) of the adaptive peak reference (`~550ms` half-life at `50 FPS`).
 ///
-/// Makes vowel and consonant onsets jump immediately on screen.
-const LEVEL_ATTACK: f32 = 0.86;
+/// Re-normalizes gain quickly between loud and soft phrases.
+const ADAPTIVE_PEAK_DECAY: f32 = 0.975;
 
-/// Crisp release decay (`0.60`) per `20ms` frame when voice energy drops between syllables.
+/// Near-instant attack weight (`0.95`) when voice amplitude rises.
 ///
-/// Carves deep valleys between spoken words so the scrolling waveform visibly dances.
-const LEVEL_DECAY: f32 = 0.60;
+/// Preserves sharp plosive and vowel onset spikes with no sluggish lag.
+const LEVEL_ATTACK: f32 = 0.95;
 
-/// Rolling adaptive-gain waveform bar state updated at `50 FPS` while listening.
+/// Fast release decay (`0.26`) per `20ms` frame when voice energy drops between syllables.
+///
+/// Carves crisp, deep valleys right down to baseline between words and consonants instead of
+/// smearing spikes into smooth ramps.
+const LEVEL_DECAY: f32 = 0.26;
+
+/// Rolling voice-spike oscilloscope bar state updated at `50 FPS` while listening.
 #[derive(Debug, Clone)]
 pub struct WaveformAnimator {
     bars: [f32; WAVEFORM_BARS],
@@ -68,29 +74,36 @@ impl Default for WaveformAnimator {
 }
 
 impl WaveformAnimator {
-    /// Creates an initialized waveform animator at calm idle baseline.
+    /// Creates an initialized waveform animator at flat zero baseline.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             bars: [0.0; WAVEFORM_BARS],
             smoothed_level: 0.0,
-            adaptive_peak: 0.045,
+            adaptive_peak: MIN_ADAPTIVE_PEAK,
         }
     }
 
-    /// Advances the scrolling waveform by one frame given microphone `level` and `elapsed_secs`.
+    /// Advances the scrolling voice trace by one frame given DC-blocked AC `raw_level`.
     pub fn step(&mut self, raw_level: f32, _elapsed_secs: f32) {
         let clean = (raw_level - NOISE_FLOOR_LEVEL).max(0.0);
         self.adaptive_peak = (self.adaptive_peak * ADAPTIVE_PEAK_DECAY)
-            .max(clean)
+            .max(clean.min(MAX_ADAPTIVE_PEAK))
             .max(MIN_ADAPTIVE_PEAK);
 
-        let normalized = (clean / self.adaptive_peak).powf(0.62).clamp(0.0, 1.0);
+        let normalized = if clean <= 0.0 {
+            0.0
+        } else {
+            (clean / self.adaptive_peak).powf(0.84).clamp(0.0, 1.0)
+        };
 
-        if normalized > self.smoothed_level {
+        if normalized >= self.smoothed_level {
             self.smoothed_level += (normalized - self.smoothed_level) * LEVEL_ATTACK;
         } else {
-            self.smoothed_level *= LEVEL_DECAY;
+            self.smoothed_level = normalized + (self.smoothed_level - normalized) * LEVEL_DECAY;
+            if self.smoothed_level < 0.015 {
+                self.smoothed_level = 0.0;
+            }
         }
 
         self.bars.copy_within(1..WAVEFORM_BARS, 0);
@@ -106,7 +119,7 @@ impl WaveformAnimator {
             return;
         }
 
-        let bar_half_heights = compute_bar_half_heights(&self.bars, elapsed_secs);
+        let bar_half_heights = compute_bar_half_heights(&self.bars);
         let pulse = 0.5 + 0.5 * (elapsed_secs * 5.2).sin();
         let voice_boost = self.smoothed_level;
 
@@ -122,19 +135,19 @@ impl WaveformAnimator {
     }
 }
 
-fn compute_bar_half_heights(
-    bars: &[f32; WAVEFORM_BARS],
-    elapsed_secs: f32,
-) -> [f32; WAVEFORM_BARS] {
+fn compute_bar_half_heights(bars: &[f32; WAVEFORM_BARS]) -> [f32; WAVEFORM_BARS] {
     let mut out = [2.0_f32; WAVEFORM_BARS];
-    let max_idx = (WAVEFORM_BARS - 1) as f32;
 
     for (i, &level) in bars.iter().enumerate() {
-        let norm_pos = (i as f32) / max_idx;
-        let edge_taper = (PI * norm_pos).sin().powf(0.28).clamp(0.40, 1.0);
-        let idle_ripple = 0.22 * ((elapsed_secs * 5.0) + (i as f32) * 0.45).sin().abs();
-        let speech_swing = level * edge_taper * 22.5;
-        out[i] = (2.0 + speech_swing + idle_ripple).clamp(2.0, 24.5);
+        // Keep full 1.0 scale at the live right-edge playhead and across the trace; only
+        // gently taper the oldest 2 exiting bars on the far left next to the divider.
+        let exit_taper = match i {
+            0 => 0.65,
+            1 => 0.85,
+            _ => 1.0,
+        };
+        let speech_swing = level * exit_taper * 23.0;
+        out[i] = (2.0 + speech_swing).clamp(2.0, 25.0);
     }
     out
 }
@@ -288,6 +301,15 @@ mod tests {
         assert!(
             alpha >= 220,
             "expected opaque HUD interior, got alpha={alpha}"
+        );
+
+        // Verify crisp inter-syllable drop to near-zero within 2 silent frames.
+        anim.step(0.001, 0.14);
+        anim.step(0.001, 0.16);
+        let valley = anim.bars[WAVEFORM_BARS - 1];
+        assert!(
+            valley < 0.10,
+            "expected crisp valley between syllables, got {valley}"
         );
     }
 }
