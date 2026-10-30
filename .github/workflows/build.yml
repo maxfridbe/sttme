@@ -82,10 +82,24 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy lints
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: |
+          if ! cargo clippy --all-targets --locked -- -D warnings 2>&1 | tee clippy.log; then
+            echo "### Clippy Failure" >> "$GITHUB_STEP_SUMMARY"
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat clippy.log | head -n 60 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       - name: Run unit tests
-        run: cargo test --locked
+        run: |
+          if ! cargo test --locked 2>&1 | tee test.log; then
+            echo "### Test Failure" >> "$GITHUB_STEP_SUMMARY"
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat test.log | head -n 60 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
   build-linux:
     name: Build Linux (${{ matrix.arch }})
